@@ -1,0 +1,6 @@
+# Accepted findings (reviewed). Everything else HIGH/CRITICAL fails the build.
+# The ALB is intentionally internet-facing and public on 80/443 (80 only redirects to 443).
+AVD-AWS-0053
+AVD-AWS-0107
+# Tasks need outbound HTTPS to ECR/CloudWatch through the NAT gateway.
+AVD-AWS-0104

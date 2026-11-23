@@ -1,0 +1,83 @@
+name: CD
+
+# Runs after CI succeeds on main, so only a tested and scanned image is ever deployed.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  SHA: ${{ github.event.workflow_run.head_sha }}
+
+jobs:
+  deploy:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Record current task definition (rollback target)
+        id: previous
+        run: |
+          arn=$(aws ecs describe-services --cluster "${{ vars.ECS_CLUSTER }}" --services "${{ vars.ECS_SERVICE }}" \
+            --query 'services[0].taskDefinition' --output text)
+          echo "arn=$arn" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch task definition
+        run: |
+          aws ecs describe-task-definition --task-definition "${{ steps.previous.outputs.arn }}" \
+            --query taskDefinition > task-definition.json
+
+      - name: Render task definition with new image
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: app
+          image: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ env.SHA }}
+
+      - name: Deploy to ECS (rolling update, waits for stability)
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          cluster: ${{ vars.ECS_CLUSTER }}
+          service: ${{ vars.ECS_SERVICE }}
+          wait-for-service-stability: true
+          wait-for-minutes: 10
+
+      - name: Smoke test - live endpoint reports the new version
+        run: |
+          for i in $(seq 1 20); do
+            body=$(curl -fsS --max-time 10 "${{ vars.APP_URL }}/healthz" || true)
+            echo "attempt $i: $body"
+            if [ "$(echo "$body" | jq -r '.status + " " + .version')" = "ok $SHA" ]; then
+              echo "Deployment verified"; exit 0
+            fi
+            sleep 10
+          done
+          echo "Live version did not match $SHA"; exit 1
+
+      - name: Roll back to previous task definition
+        if: failure() && steps.previous.outputs.arn != ''
+        run: |
+          aws ecs update-service --cluster "${{ vars.ECS_CLUSTER }}" --service "${{ vars.ECS_SERVICE }}" \
+            --task-definition "${{ steps.previous.outputs.arn }}" > /dev/null
+          aws ecs wait services-stable --cluster "${{ vars.ECS_CLUSTER }}" --services "${{ vars.ECS_SERVICE }}"
+          echo "Rolled back to ${{ steps.previous.outputs.arn }}"
