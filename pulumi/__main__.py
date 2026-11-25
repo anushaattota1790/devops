@@ -11,6 +11,7 @@ project = config.get("project") or "healthz-app"
 domain_name = config.require("domainName")
 hosted_zone_name = config.require("hostedZoneName")
 github_repository = config.require("githubRepository")
+github_oidc_subject = config.get("githubOidcSubject") or f"repo:{github_repository}:ref:refs/heads/main"
 deploy_service = config.get_bool("deployService") or False
 image_tag = config.get("imageTag")
 if deploy_service and not image_tag:
@@ -209,7 +210,7 @@ def create_iam_roles(repository: aws.ecr.Repository):
             "Condition": {
                 "StringEquals": {
                     "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-                    "token.actions.githubusercontent.com:sub": f"repo:{github_repository}:ref:refs/heads/main",
+                    "token.actions.githubusercontent.com:sub": github_oidc_subject,
                 }
             },
         }],

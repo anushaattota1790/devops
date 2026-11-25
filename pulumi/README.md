@@ -70,6 +70,18 @@ The `pulumi config set` commands write the stack's configuration to
 `Pulumi.dev.yaml`. `Pulumi.template.yaml` shows the available values but is not
 loaded automatically.
 
+For repositories using GitHub's immutable OIDC subjects, including repositories
+created after July 15, 2026, set the exact main-branch subject before deploying:
+
+```powershell
+pulumi config set githubOidcSubject 'repo:owner@OWNER_ID/repository@REPOSITORY_ID:ref:refs/heads/main'
+```
+
+Replace the names and IDs with your repository's values. You can find the
+repository and owner IDs at `https://api.github.com/repos/owner/repository`
+(`id` and `owner.id`, respectively). The default, when this setting is absent,
+is the legacy name-only subject. See the [GitHub OIDC documentation](https://docs.github.com/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services).
+
 If the AWS account already has the GitHub OIDC provider at
 `https://token.actions.githubusercontent.com`, set the following to reuse it;
 otherwise this project creates one:

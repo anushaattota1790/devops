@@ -62,6 +62,8 @@ def check_stack(stage):
     }
     if stage == "existing-oidc":
         values["healthz-app:useExistingGithubOidcProvider"] = "true"
+    if stage == "immutable-oidc":
+        values["healthz-app:githubOidcSubject"] = "repo:owner@123/repository@456:ref:refs/heads/main"
     if deploy_service and stage != "missing-tag":
         values["healthz-app:imageTag"] = "test-sha"
     pulumi.runtime.set_all_config(values)
@@ -90,6 +92,13 @@ def check_stack(stage):
     assert resources["target-group"][1]["targetType"] == "ip"
     assert resources["target-group"][1]["healthCheck"]["path"] == "/healthz"
     assert ("github-oidc" in resources) == (stage != "existing-oidc")
+    trust = json.loads(resources["github-role"][1]["assumeRolePolicy"])
+    subject = trust["Statement"][0]["Condition"]["StringEquals"]["token.actions.githubusercontent.com:sub"]
+    assert subject == (
+        "repo:owner@123/repository@456:ref:refs/heads/main"
+        if stage == "immutable-oidc"
+        else "repo:owner/repository:ref:refs/heads/main"
+    )
     assert ("service" in resources) == deploy_service
     if deploy_service:
         service = resources["service"][1]
@@ -105,7 +114,7 @@ def check_stack(stage):
 
 class StackTests(unittest.TestCase):
     def test_bootstrap_and_deployed_stack(self):
-        for stage in ("bootstrap", "service", "existing-oidc", "missing-tag"):
+        for stage in ("bootstrap", "service", "existing-oidc", "immutable-oidc", "missing-tag"):
             with self.subTest(stage=stage):
                 result = subprocess.run(
                     [sys.executable, __file__, stage], capture_output=True, text=True, check=False, timeout=30
@@ -114,7 +123,9 @@ class StackTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 2 and sys.argv[1] in ("bootstrap", "service", "existing-oidc", "missing-tag"):
+    if len(sys.argv) == 2 and sys.argv[1] in (
+        "bootstrap", "service", "existing-oidc", "immutable-oidc", "missing-tag"
+    ):
         check_stack(sys.argv[1])
     else:
         unittest.main()

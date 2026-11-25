@@ -5,6 +5,8 @@ config:
   healthz-app:domainName: healthz.example.com
   healthz-app:hostedZoneName: example.com
   healthz-app:githubRepository: owner/repository
+  # For repositories using immutable GitHub OIDC subjects, set this to the exact main-branch subject.
+  # healthz-app:githubOidcSubject: repo:owner@123/repository@456:ref:refs/heads/main
   healthz-app:useExistingGithubOidcProvider: false
   healthz-app:deployService: false
   # Set imageTag only after pushing the image to the new ECR repository.
