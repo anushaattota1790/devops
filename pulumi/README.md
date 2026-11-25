@@ -119,35 +119,42 @@ Set these GitHub repository Actions **variables** using the stack outputs:
 
 ## 3. Build and push an image with CI
 
-Push the reviewed project changes to `main`. Once CI succeeds, it pushes the
-image to ECR tagged with the commit SHA. Find that SHA in the GitHub Actions
-run or the ECR image list. The initial CD workflow run will fail because the
-ECS service does not exist yet.
+Set `main` as the GitHub repository's default branch, push the reviewed changes,
+and push a release tag on a commit reachable from `main`:
+
+```powershell
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+CI checks the tagged commit. CD verifies the tag, then builds, scans and pushes
+the image to ECR as `v1.0.0`. The initial CD workflow run will fail after the
+image push because the ECS service does not exist yet.
 
 ## 4. Start the service
 
-Use the SHA of the image that CI successfully pushed:
+Use the release tag of the image that CD successfully pushed:
 
 ```powershell
-pulumi config set imageTag <sha-from-ci>
+pulumi config set imageTag v1.0.0
 pulumi config set deployService true
 pulumi preview
 pulumi up
 ```
 
-Replace `<sha-from-ci>` with the actual SHA. Wait for ECS tasks and the ALB
+Replace `v1.0.0` with the actual tag. Wait for ECS tasks and the ALB
 target group to become healthy. Test the HTTPS URL returned by
 `pulumi stack output appUrl`, followed by `/healthz` and `/readyz`. Test that
 the HTTP URL redirects to HTTPS.
 
-The existing CI and CD workflows deploy pushes to `main`. CD manages the ECS
+CI checks pushes to `main`; CD deploys only release tags. CD manages the ECS
 task definition, while autoscaling manages desired count; Pulumi ignores changes
 to those two service properties. **Run `pulumi refresh` before later Pulumi
 updates**, then preview the changes, so Pulumi state reflects deployments made
 outside Pulumi. Review changes carefully before applying.
 
 The bootstrap task definition intentionally does not set `APP_VERSION`: CI
-bakes the commit SHA into the image and CD checks that `/healthz` returns it.
+bakes the release tag into the image and CD checks that `/healthz` returns it.
 Do not retain the manually configured `APP_VERSION=0.1.0` in the new service.
 Infrastructure updates are not currently automated by the GitHub workflows;
 Pulumi commands above are run manually.

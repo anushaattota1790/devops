@@ -20,7 +20,7 @@ app.state.ready = False
 
 @app.get("/healthz")
 def healthz() -> dict[str, str | None]:
-    # APP_VERSION is baked into the image at build time (git SHA).
+    # APP_VERSION is baked into the image at build time.
     return {
         "status": "ok",
         "version": os.getenv("APP_VERSION", "dev"),

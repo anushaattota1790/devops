@@ -3,8 +3,8 @@
 A small FastAPI service containerised and deployed to **AWS ECS Fargate** behind an **ALB with TLS**, provisioned by **Pulumi** and delivered by **GitHub Actions**.
 
 ```
-git push main ─► CI (test, SAST, dep scan, IaC/secret scan, build, image scan, push to ECR)
-                  └─► CD (render task def, rolling deploy, wait stable, smoke test, auto rollback)
+git push origin main ─► CI (test, SAST, dep scan, IaC/secret scan, build, image scan)
+git push v1.0.0 ─► CI ─► CD (verify tag, build and scan, push to ECR, deploy, smoke test, rollback)
 
 Route53 ─► ALB :443 (ACM cert, TLS 1.3 policy) ─► ECS Fargate tasks (private subnets, HTTPS :8443)
 ```
@@ -17,16 +17,16 @@ Route53 ─► ALB :443 (ACM cert, TLS 1.3 policy) ─► ECS Fargate tasks (pri
 | `tests/` | pytest unit tests |
 | `Dockerfile` | Multi-stage, slim base, non-root (uid 10001), env-var config, `HEALTHCHECK` |
 | `pulumi/` | VPC, ALB, ACM, Route53, ECR, ECS Fargate, IAM and GitHub OIDC role; see its [setup guide](pulumi/README.md) |
-| `.github/workflows/ci.yml` | Test, scan, build, push |
-| `.github/workflows/cd.yml` | Deploy, verify, roll back |
+| `.github/workflows/ci.yml` | Test, scan and build |
+| `.github/workflows/cd.yml` | Verify release, build, scan, push, deploy and roll back |
 
 ## The application
 
-`GET /healthz` → `{"status":"ok","version":"<git sha>","previous_version":"<previous git sha>"}`
+`GET /healthz` → `{"status":"ok","version":"v1.0.0","previous_version":"v0.9.0"}`
 
 `GET /readyz` → `200 {"status":"ready"}` after application startup, or `503 {"status":"not ready"}` before startup or during shutdown. This checks the application lifecycle only; it does not check external dependencies.
 
-The version defaults to `dev` locally and is baked into the image (`--build-arg APP_VERSION=<sha>`). The deployment workflow sets `PREVIOUS_APP_VERSION` from the previous ECS task definition's image tag. The previous version is `null` when it is not supplied or the previous image is not tagged with a commit SHA, including the initial deployment. This is the version that was deployed before this task was created, not a deployment history; a rollback restores the old task's recorded value. During a rolling deployment, different tasks can temporarily report different versions.
+The version defaults to `dev` locally and the release tag is baked into the image (`--build-arg APP_VERSION=v1.0.0`). The deployment workflow sets `PREVIOUS_APP_VERSION` from the previous ECS task definition's image tag. The previous version is `null` when it is not supplied or the previous image has an unrecognized tag; older deployments can report a commit SHA. This is the version deployed before this task was created, not a deployment history; a rollback restores the old task's recorded value. During a rolling deployment, different tasks can temporarily report different versions.
 
 Config (env vars): `PORT` (default 8080), `ENABLE_TLS` (default false; true in ECS), `APP_VERSION`, `PREVIOUS_APP_VERSION`, `HOST`.
 
@@ -62,18 +62,23 @@ docker run --rm -p 8080:8080 healthz-app
    | `ECS_CLUSTER` / `ECS_SERVICE` | `healthz-app` |
    | `APP_URL` | `https://<domain_name>` |
 
-3. **Push to `main`** – CI builds and pushes `healthz-app:<sha>` to ECR. CD will fail on this initial run because the ECS service does not exist yet.
+3. Ensure `main` is the repository's default branch. Push the reviewed changes to `main`, then create and push a release tag on that commit:
+   ```bash
+   git tag v1.0.0
+   git push origin v1.0.0
+   ```
+   CI tests the tag; CD verifies it points to a commit on `main`, builds and scans the release image, and pushes `healthz-app:v1.0.0` to ECR. On the first release, CD fails after the push because the ECS service does not exist yet.
 
 4. **Create the service** using the image CI just pushed, from the `pulumi` directory:
    ```bash
-   pulumi config set imageTag <sha-from-ci>
+   pulumi config set imageTag v1.0.0
    pulumi config set deployService true
    pulumi preview
    pulumi up
    ```
    The service starts using the existing ALB, certificate and Route53 record.
 
-5. From now on every merge to `main` deploys automatically.
+5. From now on, pushes to `main` run CI but do not deploy. Push a new `vMAJOR.MINOR.PATCH` tag on a commit reachable from `main` to release it. Restrict who can create or move release tags using GitHub rulesets.
 
 > If the account already has the GitHub OIDC provider, set `pulumi config set useExistingGithubOidcProvider true` before provisioning.
 > Review `pulumi preview --destroy` before `pulumi destroy`. The NAT gateway and ALB cost money while running.
@@ -83,27 +88,26 @@ docker run --rm -p 8080:8080 healthz-app
 ```bash
 curl -i https://<domain>/healthz            # 200 with current and previous versions
 curl -i http://<domain>/healthz             # 301 to HTTPS
-git rev-parse HEAD                          # should equal "version" after CD finishes
+git tag --points-at HEAD                   # release tag should equal "version" after CD finishes
 ```
 
-To see the pipeline prove the latest code is live: change something, merge to `main`, and watch the CD smoke test poll `/healthz` until `version` equals the new commit SHA.
+To see the pipeline prove the latest release is live: merge to `main`, push a new release tag, and watch the CD smoke test poll `/healthz` until `version` equals that tag.
 
 ## CI/CD behaviour
 
-**CI** (`ci.yml`, PRs and `main`)
+**CI** (`ci.yml`, PRs, `main`, and release tags)
 1. pytest unit tests
 2. bandit (SAST) and pip-audit (dependency CVEs)
 3. Trivy filesystem scan for secrets and supported IaC misconfigurations (`.trivyignore` documents accepted findings)
 4. Docker build, then Trivy image scan (fails on fixable HIGH/CRITICAL)
-5. On `main` only: assume AWS role via OIDC, push the image to ECR tagged with the commit SHA (ECR tags are immutable, so a tag always maps to exactly one image)
+5. For a `vMAJOR.MINOR.PATCH` tag, upload release metadata after all checks pass. Tag pushes themselves do not receive AWS credentials.
 
-**CD** (`cd.yml`, runs only after CI succeeds on `main`)
-1. Record the current task definition (rollback target)
-2. Render a new task definition revision with the new image and deploy a rolling update (100% min healthy, 200% max)
-3. Wait for service stability. The ECS deployment **circuit breaker** also rolls back automatically if new tasks never become healthy
-4. Smoke test the public URL until `/healthz` returns `ok`, the new SHA, and the previous version
-5. If anything fails, the pipeline explicitly rolls the service back to the previous task definition
-6. Deploys are serialised (`concurrency`) so two runs cannot race
+**CD** (`cd.yml`, triggered after CI succeeds)
+1. Ignore runs without release metadata. Validate the version and verify that the tag points to the tested commit on `main`.
+2. Rebuild and scan the release image, then push it with the immutable release tag. The image's `org.opencontainers.image.revision` label records the commit SHA. For a retry, an existing image is verified and scanned before use.
+3. Record the current task definition, then deploy a rolling update (100% min healthy, 200% max) and wait for stability. The ECS deployment **circuit breaker** also rolls back if new tasks never become healthy.
+4. Smoke test `/healthz` for the release and previous version. If deployment or validation fails, roll back to the recorded task definition.
+5. Deployments are serialised (`concurrency`) so two runs cannot race.
 
 ## Security
 
@@ -117,9 +121,9 @@ To see the pipeline prove the latest code is live: change something, merge to `m
 
 - **Trunk-based / GitHub Flow**: `main` is always deployable and protected (no direct pushes, PR required, CI status checks required, at least one review, linear history)
 - Short-lived `feature/*`, `fix/*` branches off `main`; small PRs; squash merge
-- CI runs on every PR (tests + scans + image build/scan, no push). Merge to `main` triggers build, push and deploy
-- **Versioning**: image tagged with the git SHA (immutable, traceable); semantic version git tags (`v1.2.0`) mark releases. Conventional Commits can automate the changelog and version bump
-- **Hotfix**: branch from `main`, fast-track PR; rollback is just redeploying the previous SHA/task definition
+- CI runs on every PR and push to `main` (tests + scans + image build/scan, no push). Pushing a release tag triggers the deployment.
+- **Versioning**: image tagged with the immutable release version (`v1.2.0`); the image label records the git SHA. Conventional Commits can automate the changelog and version bump
+- **Hotfix**: branch from `main`, fast-track PR; rollback restores the previous task definition
 - **Release safety**: feature flags for incomplete work; environments (dev → staging → prod) with approval gates can be added by promoting the same image digest
 
 ## Trade-offs and next steps

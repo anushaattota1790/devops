@@ -1,13 +1,13 @@
 name: CD
 
-# Runs after CI succeeds on main, so only a tested and scanned image is ever deployed.
+# workflow_run uses the default branch; it must be main for the OIDC trust policy.
 on:
   workflow_run:
     workflows: [CI]
     types: [completed]
-    branches: [main]
 
 permissions:
+  actions: read
   contents: read
   id-token: write
 
@@ -23,29 +23,174 @@ jobs:
     if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
     runs-on: ubuntu-latest
     steps:
+      - name: Check for release metadata
+        id: release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const name = `release-version-${context.payload.workflow_run.run_attempt}`;
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.payload.workflow_run.id,
+              per_page: 100,
+            });
+            const matches = artifacts.filter(artifact => artifact.name === name && !artifact.expired);
+            if (matches.length > 1) throw new Error("Multiple release metadata artifacts found");
+            core.setOutput("found", matches.length === 1 ? "true" : "false");
+
+      - name: Download release metadata
+        if: steps.release.outputs.found == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: release-version-${{ github.event.workflow_run.run_attempt }}
+          path: ${{ runner.temp }}/release-metadata
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Validate release version
+        if: steps.release.outputs.found == 'true'
+        id: version
+        env:
+          METADATA_DIR: ${{ runner.temp }}/release-metadata
+        run: |
+          version=$(cat "$METADATA_DIR/release-version.txt")
+          if [[ ! "$version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || (( ${#version} > 128 )); then
+            echo "::error::Release metadata contains an invalid version."
+            exit 1
+          fi
+          if [[ ! "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::CI did not report a valid commit SHA."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        if: steps.release.outputs.found == 'true'
+        with:
+          ref: ${{ env.SHA }}
+          fetch-depth: 0
+
+      - name: Verify release belongs to main
+        if: steps.release.outputs.found == 'true'
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git fetch origin '+refs/heads/main:refs/remotes/origin/main'
+          tag_commit=$(git rev-parse "refs/tags/${RELEASE_VERSION}^{commit}")
+          if [[ "$tag_commit" != "$SHA" ]]; then
+            echo "::error::Release tag does not point to the commit tested by CI."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$SHA" refs/remotes/origin/main; then
+            echo "::error::Release commit is not on main."
+            exit 1
+          fi
+
       - name: Configure AWS credentials (OIDC)
+        if: steps.release.outputs.found == 'true'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: Login to Amazon ECR
+        if: steps.release.outputs.found == 'true'
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Record current task definition (rollback target)
-        id: previous
+      - name: Check for an existing release image
+        if: steps.release.outputs.found == 'true'
+        id: image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          arn=$(aws ecs describe-services --cluster "${{ vars.ECS_CLUSTER }}" --services "${{ vars.ECS_SERVICE }}" \
+          image="$REGISTRY/$REPOSITORY:$RELEASE_VERSION"
+          failures=$(aws ecr batch-get-image --repository-name "$REPOSITORY" \
+            --image-ids "imageTag=$RELEASE_VERSION" --query failures --output json)
+          if jq -e 'length == 0' <<< "$failures" > /dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          elif jq -e 'length == 1 and .[0].failureCode == "ImageNotFound"' <<< "$failures" > /dev/null; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::ECR could not check the release image: $failures"
+            exit 1
+          fi
+          echo "ref=$image" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.release.outputs.found == 'true' && steps.image.outputs.exists == 'false'
+
+      - name: Build release image
+        if: steps.release.outputs.found == 'true' && steps.image.outputs.exists == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ steps.image.outputs.ref }}
+          build-args: APP_VERSION=${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.revision=${{ env.SHA }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Pull and verify existing release image
+        if: steps.release.outputs.found == 'true' && steps.image.outputs.exists == 'true'
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          docker pull "$IMAGE"
+          revision=$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
+          version=$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')
+          if [[ "$revision" != "$SHA" || "$version" != "$RELEASE_VERSION" ]]; then
+            echo "::error::The immutable release image does not match the requested commit and version."
+            exit 1
+          fi
+
+      - name: Scan release image
+        if: steps.release.outputs.found == 'true'
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ steps.image.outputs.ref }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Push release image to ECR
+        if: steps.release.outputs.found == 'true' && steps.image.outputs.exists == 'false'
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+        run: docker push "$IMAGE"
+
+      - name: Record current task definition (rollback target)
+        if: steps.release.outputs.found == 'true'
+        id: previous
+        env:
+          CLUSTER: ${{ vars.ECS_CLUSTER }}
+          SERVICE: ${{ vars.ECS_SERVICE }}
+        run: |
+          arn=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
             --query 'services[0].taskDefinition' --output text)
+          if [[ "$arn" != arn:* ]]; then
+            echo "::error::ECS service has no current task definition."
+            exit 1
+          fi
           echo "arn=$arn" >> "$GITHUB_OUTPUT"
 
       - name: Fetch task definition
+        if: steps.release.outputs.found == 'true'
+        env:
+          TASK_DEFINITION: ${{ steps.previous.outputs.arn }}
         run: |
-          aws ecs describe-task-definition --task-definition "${{ steps.previous.outputs.arn }}" \
+          aws ecs describe-task-definition --task-definition "$TASK_DEFINITION" \
             --query taskDefinition > task-definition.json
 
       - name: Identify previous deployment version
+        if: steps.release.outputs.found == 'true'
         id: previous_version
         run: |
           image=$(jq -er '
@@ -53,24 +198,26 @@ jobs:
             if length == 1 and (.[0] | type == "string") then .[0]
             else error("Expected exactly one app container image") end
           ' task-definition.json)
-          if [[ "$image" =~ :([0-9a-f]{40})$ ]]; then
+          if [[ "$image" =~ :(v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)|[0-9a-f]{40})$ ]]; then
             echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::Previous image does not have a commit SHA tag; previous version is unknown."
+            echo "::warning::Previous image version is unknown."
             echo "version=" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Render task definition with new image
+      - name: Render task definition with release image
+        if: steps.release.outputs.found == 'true'
         id: render
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
           task-definition: task-definition.json
           container-name: app
-          image: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ env.SHA }}
+          image: ${{ steps.image.outputs.ref }}
           environment-variables: |
             PREVIOUS_APP_VERSION=${{ steps.previous_version.outputs.version }}
 
       - name: Deploy to ECS (rolling update, waits for stability)
+        if: steps.release.outputs.found == 'true'
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
           task-definition: ${{ steps.render.outputs.task-definition }}
@@ -80,14 +227,17 @@ jobs:
           wait-for-minutes: 10
 
       - name: Smoke test - live endpoint reports deployment versions
+        if: steps.release.outputs.found == 'true'
         env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
           PREVIOUS_VERSION: ${{ steps.previous_version.outputs.version }}
+          APP_URL: ${{ vars.APP_URL }}
         run: |
           for i in $(seq 1 20); do
-            body=$(curl -fsS --max-time 10 "${{ vars.APP_URL }}/healthz" || true)
+            body=$(curl -fsS --max-time 10 "$APP_URL/healthz" || true)
             echo "attempt $i: $body"
-            if echo "$body" | jq -e --arg sha "$SHA" --arg previous "$PREVIOUS_VERSION" \
-              '.status == "ok" and .version == $sha and .previous_version == (if $previous == "" then null else $previous end)' > /dev/null; then
+            if echo "$body" | jq -e --arg version "$RELEASE_VERSION" --arg previous "$PREVIOUS_VERSION" \
+              '.status == "ok" and .version == $version and .previous_version == (if $previous == "" then null else $previous end)' > /dev/null; then
               echo "Deployment verified"; exit 0
             fi
             sleep 10
@@ -96,8 +246,12 @@ jobs:
 
       - name: Roll back to previous task definition
         if: failure() && steps.previous.outputs.arn != ''
+        env:
+          CLUSTER: ${{ vars.ECS_CLUSTER }}
+          SERVICE: ${{ vars.ECS_SERVICE }}
+          TASK_DEFINITION: ${{ steps.previous.outputs.arn }}
         run: |
-          aws ecs update-service --cluster "${{ vars.ECS_CLUSTER }}" --service "${{ vars.ECS_SERVICE }}" \
-            --task-definition "${{ steps.previous.outputs.arn }}" > /dev/null
-          aws ecs wait services-stable --cluster "${{ vars.ECS_CLUSTER }}" --services "${{ vars.ECS_SERVICE }}"
-          echo "Rolled back to ${{ steps.previous.outputs.arn }}"
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" \
+            --task-definition "$TASK_DEFINITION" > /dev/null
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+          echo "Rolled back to $TASK_DEFINITION"
