@@ -87,6 +87,9 @@ def check_stack(stage):
         raise AssertionError("A service deployment without an image tag must fail.")
 
     resources = mocks.resources
+    lifecycle = json.loads(resources["repository-lifecycle"][1]["policy"])
+    assert lifecycle["rules"]
+    assert all(rule["selection"]["tagStatus"] == "untagged" for rule in lifecycle["rules"])
     assert resources["private-routes"][1]["routes"][0]["natGatewayId"] == "nat-id"
     assert resources["public-routes"][1]["routes"][0]["gatewayId"] == "internet-gateway-id"
     assert resources["target-group"][1]["targetType"] == "ip"

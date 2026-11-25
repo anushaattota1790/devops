@@ -68,7 +68,8 @@ Replace the example domain, zone and GitHub repository with your own values.
 The DNS name must be inside the existing public hosted zone.
 The `pulumi config set` commands write the stack's configuration to
 `Pulumi.dev.yaml`. `Pulumi.template.yaml` shows the available values but is not
-loaded automatically.
+loaded automatically. Generated stack configuration files are ignored by Git;
+share any required settings securely and never commit the secrets passphrase.
 
 For repositories using GitHub's immutable OIDC subjects, including repositories
 created after July 15, 2026, set the exact main-branch subject before deploying:
@@ -116,48 +117,55 @@ Set these GitHub repository Actions **variables** using the stack outputs:
 | `ECS_CLUSTER` | `pulumi stack output ecsCluster` |
 | `ECS_SERVICE` | `healthz-app`, or your configured project name |
 | `APP_URL` | `pulumi stack output appUrl` |
+| `BOOTSTRAP_MODE` | `true` for the first image only; remove it or set it to `false` after the service is created |
 
-## 3. Build and push an image with CI
+## 3. Build and push an image with CI/CD
 
-Set `main` as the GitHub repository's default branch, push the reviewed changes,
-and push a release tag on a commit reachable from `main`:
-
-```powershell
-git tag v1.0.0
-git push origin v1.0.0
-```
-
-CI checks the tagged commit. CD verifies the tag, then builds, scans and pushes
-the image to ECR as `v1.0.0`. The initial CD workflow run will fail after the
-image push because the ECS service does not exist yet.
+Set `main` as the GitHub repository's default branch, set `BOOTSTRAP_MODE` to
+`true`, and push the reviewed changes. CI checks the commit; CD builds, scans
+and pushes the image to ECR as `sha-<full-commit-SHA>`. If the service does not
+yet exist, CD reports the bootstrap state and stops after the image push.
 
 ## 4. Start the service
 
-Use the release tag of the image that CD successfully pushed:
+Use the full commit SHA from the successful CI run to configure the image tag:
 
 ```powershell
-pulumi config set imageTag v1.0.0
+pulumi config set imageTag sha-<full-commit-SHA>
 pulumi config set deployService true
 pulumi preview
 pulumi up
 ```
 
-Replace `v1.0.0` with the actual tag. Wait for ECS tasks and the ALB
+Replace the placeholder with the actual tag. Wait for ECS tasks and the ALB
 target group to become healthy. Test the HTTPS URL returned by
 `pulumi stack output appUrl`, followed by `/healthz` and `/readyz`. Test that
 the HTTP URL redirects to HTTPS.
 
-CI checks pushes to `main`; CD deploys only release tags. CD manages the ECS
+Remove the `BOOTSTRAP_MODE` GitHub variable or set it to `false` after the
+service exists, so an unexpectedly missing service causes a deployment failure.
+Successful pushes to `main` trigger deployment automatically. Stale runs are
+rejected if `main` has moved before verification, and newer runs can replace
+pending runs. `vMAJOR.MINOR.PATCH` tags can also be pushed to deploy a named release. CD manages the ECS
 task definition, while autoscaling manages desired count; Pulumi ignores changes
 to those two service properties. **Run `pulumi refresh` before later Pulumi
 updates**, then preview the changes, so Pulumi state reflects deployments made
 outside Pulumi. Review changes carefully before applying.
 
-The bootstrap task definition intentionally does not set `APP_VERSION`: CI
-bakes the release tag into the image and CD checks that `/healthz` returns it.
-Do not retain the manually configured `APP_VERSION=0.1.0` in the new service.
+The bootstrap task definition does not set `APP_VERSION`: CD bakes the version
+into the image. Later deployments set `APP_VERSION` and `PREVIOUS_APP_VERSION`
+to the corresponding deployment versions. Do not retain a manually configured
+fixed version such as `APP_VERSION=0.1.0`.
 Infrastructure updates are not currently automated by the GitHub workflows;
 Pulumi commands above are run manually.
+
+The ECR lifecycle policy retains tagged images so that active and rollback
+images are not automatically expired. Untagged images older than 30 days are
+eligible for expiry. Tagged images accrue storage charges; review and remove
+obsolete images deliberately only after checking deployment and rollback needs.
+The lifecycle policy is deleted before replacement because each repository has
+only one policy. During replacement there is briefly no lifecycle policy; if
+creation fails, review the error and retry before relying on image expiry.
 
 ## Tests and cleanup
 

@@ -23,7 +23,7 @@ jobs:
     if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
     runs-on: ubuntu-latest
     steps:
-      - name: Check for release metadata
+      - name: Check for deployment metadata
         id: release
         uses: actions/github-script@v7
         with:
@@ -37,6 +37,10 @@ jobs:
             });
             const matches = artifacts.filter(artifact => artifact.name === name && !artifact.expired);
             if (matches.length > 1) throw new Error("Multiple release metadata artifacts found");
+            const branch = context.payload.workflow_run.head_branch;
+            if (matches.length === 0 && (branch === "main" || branch?.startsWith("v"))) {
+              throw new Error("Expected deployment metadata is missing or expired");
+            }
             core.setOutput("found", matches.length === 1 ? "true" : "false");
 
       - name: Download release metadata
@@ -48,19 +52,26 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ github.token }}
 
-      - name: Validate release version
+      - name: Validate deployment version
         if: steps.release.outputs.found == 'true'
         id: version
         env:
           METADATA_DIR: ${{ runner.temp }}/release-metadata
+          TRIGGER_REF: ${{ github.event.workflow_run.head_branch }}
         run: |
           version=$(cat "$METADATA_DIR/release-version.txt")
-          if [[ ! "$version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || (( ${#version} > 128 )); then
-            echo "::error::Release metadata contains an invalid version."
-            exit 1
-          fi
           if [[ ! "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::CI did not report a valid commit SHA."
+            exit 1
+          fi
+          if [[ "$TRIGGER_REF" == "main" && "$version" == "main-${SHA:0:12}" ]]; then
+            echo "type=main" >> "$GITHUB_OUTPUT"
+            echo "image_tag=sha-$SHA" >> "$GITHUB_OUTPUT"
+          elif [[ "$TRIGGER_REF" == "$version" && "$version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] && (( ${#version} <= 128 )); then
+            echo "type=release" >> "$GITHUB_OUTPUT"
+            echo "image_tag=$version" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Deployment version does not match the CI push."
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -71,20 +82,28 @@ jobs:
           ref: ${{ env.SHA }}
           fetch-depth: 0
 
-      - name: Verify release belongs to main
+      - name: Verify deployment commit
         if: steps.release.outputs.found == 'true'
         env:
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          DEPLOYMENT_TYPE: ${{ steps.version.outputs.type }}
         run: |
           git fetch origin '+refs/heads/main:refs/remotes/origin/main'
-          tag_commit=$(git rev-parse "refs/tags/${RELEASE_VERSION}^{commit}")
-          if [[ "$tag_commit" != "$SHA" ]]; then
-            echo "::error::Release tag does not point to the commit tested by CI."
-            exit 1
-          fi
-          if ! git merge-base --is-ancestor "$SHA" refs/remotes/origin/main; then
-            echo "::error::Release commit is not on main."
-            exit 1
+          if [[ "$DEPLOYMENT_TYPE" == "main" ]]; then
+            if [[ "$(git rev-parse refs/remotes/origin/main)" != "$SHA" ]]; then
+              echo "::error::Main has moved since this CI run; refusing to deploy an older commit."
+              exit 1
+            fi
+          else
+            tag_commit=$(git rev-parse "refs/tags/${RELEASE_VERSION}^{commit}")
+            if [[ "$tag_commit" != "$SHA" ]]; then
+              echo "::error::Release tag does not point to the commit tested by CI."
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "$SHA" refs/remotes/origin/main; then
+              echo "::error::Release commit is not on main."
+              exit 1
+            fi
           fi
 
       - name: Configure AWS credentials (OIDC)
@@ -105,17 +124,17 @@ jobs:
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
           REPOSITORY: ${{ vars.ECR_REPOSITORY }}
-          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          IMAGE_TAG: ${{ steps.version.outputs.image_tag }}
         run: |
-          image="$REGISTRY/$REPOSITORY:$RELEASE_VERSION"
+          image="$REGISTRY/$REPOSITORY:$IMAGE_TAG"
           failures=$(aws ecr batch-get-image --repository-name "$REPOSITORY" \
-            --image-ids "imageTag=$RELEASE_VERSION" --query failures --output json)
+            --image-ids "imageTag=$IMAGE_TAG" --query failures --output json)
           if jq -e 'length == 0' <<< "$failures" > /dev/null; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
           elif jq -e 'length == 1 and .[0].failureCode == "ImageNotFound"' <<< "$failures" > /dev/null; then
             echo "exists=false" >> "$GITHUB_OUTPUT"
           else
-            echo "::error::ECR could not check the release image: $failures"
+            echo "::error::ECR could not check the deployment image: $failures"
             exit 1
           fi
           echo "ref=$image" >> "$GITHUB_OUTPUT"
@@ -172,17 +191,33 @@ jobs:
         env:
           CLUSTER: ${{ vars.ECS_CLUSTER }}
           SERVICE: ${{ vars.ECS_SERVICE }}
+          BOOTSTRAP_MODE: ${{ vars.BOOTSTRAP_MODE }}
         run: |
-          arn=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
-            --query 'services[0].taskDefinition' --output text)
+          if [[ -n "$BOOTSTRAP_MODE" && "$BOOTSTRAP_MODE" != "true" && "$BOOTSTRAP_MODE" != "false" ]]; then
+            echo "::error::BOOTSTRAP_MODE must be true or false."
+            exit 1
+          fi
+          result=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --output json)
+          if jq -e '(.services | length) == 0 and (.failures | length) == 1 and .failures[0].reason == "MISSING"' <<< "$result" > /dev/null; then
+            if [[ "$BOOTSTRAP_MODE" != "true" ]]; then
+              echo "::error::ECS service not found. Use BOOTSTRAP_MODE only for initial provisioning."
+              exit 1
+            fi
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Bootstrap image is in ECR; create the ECS service and disable BOOTSTRAP_MODE."
+            echo "Bootstrap image pushed. Create the ECS service and disable BOOTSTRAP_MODE." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          arn=$(jq -er 'if (.failures | length) == 0 and (.services | length) == 1 and .services[0].status == "ACTIVE" then .services[0].taskDefinition else error("ECS service lookup failed") end' <<< "$result")
           if [[ "$arn" != arn:* ]]; then
             echo "::error::ECS service has no current task definition."
             exit 1
           fi
+          echo "available=true" >> "$GITHUB_OUTPUT"
           echo "arn=$arn" >> "$GITHUB_OUTPUT"
 
       - name: Fetch task definition
-        if: steps.release.outputs.found == 'true'
+        if: steps.previous.outputs.available == 'true'
         env:
           TASK_DEFINITION: ${{ steps.previous.outputs.arn }}
         run: |
@@ -190,23 +225,43 @@ jobs:
             --query taskDefinition > task-definition.json
 
       - name: Identify previous deployment version
-        if: steps.release.outputs.found == 'true'
+        if: steps.previous.outputs.available == 'true'
         id: previous_version
+        env:
+          NEW_IMAGE: ${{ steps.image.outputs.ref }}
         run: |
           image=$(jq -er '
             [.containerDefinitions[] | select(.name == "app") | .image] |
             if length == 1 and (.[0] | type == "string") then .[0]
             else error("Expected exactly one app container image") end
           ' task-definition.json)
-          if [[ "$image" =~ :(v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)|[0-9a-f]{40})$ ]]; then
-            echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          current=$(jq -r '[.containerDefinitions[] | select(.name == "app") | .environment[]? | select(.name == "APP_VERSION") | .value] | first // ""' task-definition.json)
+          recorded_previous=$(jq -r '[.containerDefinitions[] | select(.name == "app") | .environment[]? | select(.name == "PREVIOUS_APP_VERSION") | .value] | first // ""' task-definition.json)
+          if [[ "$image" == "$NEW_IMAGE" ]]; then
+            version="$recorded_previous"
+            echo "already_deployed=true" >> "$GITHUB_OUTPUT"
+          elif [[ -n "$current" ]]; then
+            version="$current"
+            echo "already_deployed=false" >> "$GITHUB_OUTPUT"
+          elif [[ "$image" =~ :sha-([0-9a-f]{40})$ ]]; then
+            version="main-${BASH_REMATCH[1]:0:12}"
+            echo "already_deployed=false" >> "$GITHUB_OUTPUT"
+          elif [[ "$image" =~ :(v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)|[0-9a-f]{40})$ ]]; then
+            version="${BASH_REMATCH[1]}"
+            echo "already_deployed=false" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::Previous image version is unknown."
-            echo "version=" >> "$GITHUB_OUTPUT"
+            version=""
+            echo "already_deployed=false" >> "$GITHUB_OUTPUT"
           fi
+          if [[ -n "$version" && ! "$version" =~ ^(v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)|main-[0-9a-f]{12}|[0-9a-f]{40})$ ]]; then
+            echo "::error::Previous task definition has an invalid version."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Render task definition with release image
-        if: steps.release.outputs.found == 'true'
+      - name: Render task definition with deployment image
+        if: steps.previous.outputs.available == 'true' && steps.previous_version.outputs.already_deployed == 'false'
         id: render
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
@@ -214,10 +269,12 @@ jobs:
           container-name: app
           image: ${{ steps.image.outputs.ref }}
           environment-variables: |
+            APP_VERSION=${{ steps.version.outputs.version }}
             PREVIOUS_APP_VERSION=${{ steps.previous_version.outputs.version }}
 
       - name: Deploy to ECS (rolling update, waits for stability)
-        if: steps.release.outputs.found == 'true'
+        if: steps.previous.outputs.available == 'true' && steps.previous_version.outputs.already_deployed == 'false'
+        id: deploy
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
           task-definition: ${{ steps.render.outputs.task-definition }}
@@ -227,7 +284,8 @@ jobs:
           wait-for-minutes: 10
 
       - name: Smoke test - live endpoint reports deployment versions
-        if: steps.release.outputs.found == 'true'
+        if: steps.previous.outputs.available == 'true'
+        id: smoke
         env:
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
           PREVIOUS_VERSION: ${{ steps.previous_version.outputs.version }}
@@ -245,7 +303,7 @@ jobs:
           echo "Live deployment versions did not match the expected values"; exit 1
 
       - name: Roll back to previous task definition
-        if: failure() && steps.previous.outputs.arn != ''
+        if: failure() && steps.previous.outputs.arn != '' && (steps.deploy.outcome == 'failure' || (steps.deploy.outcome == 'success' && steps.smoke.outcome == 'failure'))
         env:
           CLUSTER: ${{ vars.ECS_CLUSTER }}
           SERVICE: ${{ vars.ECS_SERVICE }}

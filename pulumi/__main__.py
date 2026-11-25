@@ -155,15 +155,17 @@ def create_ecr_repository():
         policy=json.dumps({
             "rules": [{
                 "rulePriority": 1,
-                "description": "Keep the last 20 images",
+                "description": "Expire untagged images after 30 days",
                 "selection": {
-                    "tagStatus": "any",
-                    "countType": "imageCountMoreThan",
-                    "countNumber": 20,
+                    "tagStatus": "untagged",
+                    "countType": "sinceImagePushed",
+                    "countUnit": "days",
+                    "countNumber": 30,
                 },
                 "action": {"type": "expire"},
             }]
         }),
+        opts=pulumi.ResourceOptions(delete_before_replace=True),
     )
     return repository
 

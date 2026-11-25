@@ -50,6 +50,48 @@ def test_release_version_validation(version, valid):
     assert (result.returncode == 0) == valid, result.stderr
 
 
+@pytest.mark.parametrize(
+    ("ref", "image_version", "expected"),
+    [
+        ("refs/heads/main", "unused", "main-0123456789ab"),
+        ("refs/tags/v1.0.0", "v1.0.0", "v1.0.0"),
+        ("refs/pull/1/merge", "unused", "ci-0123456789ab"),
+    ],
+)
+def test_image_version_for_main_release_and_pull_request(tmp_path, ref, image_version, expected):
+    script = workflow_script("ci.yml", "build", "Determine image version")
+    output = tmp_path / "output"
+    result = bash_script(
+        script, ROOT, GITHUB_REF=ref, GITHUB_SHA="0123456789abcdef" * 2 + "01234567",
+        IMAGE_VERSION=image_version, GITHUB_OUTPUT=str(output),
+    )
+    assert result.returncode == 0, result.stderr
+    assert output.read_text(encoding="utf-8").strip() == f"version={expected}"
+
+
+@pytest.mark.parametrize(
+    ("ref", "version", "valid", "image_tag"),
+    [
+        ("main", "main-0123456789ab", True, "sha-0123456789abcdef0123456789abcdef01234567"),
+        ("v1.0.0", "v1.0.0", True, "v1.0.0"),
+        ("main", "v1.0.0", False, ""),
+        ("v1.0.0", "main-0123456789ab", False, ""),
+        ("main", "main-ffffffffffff", False, ""),
+    ],
+)
+def test_deployment_metadata_matches_ci_ref(tmp_path, ref, version, valid, image_tag):
+    (tmp_path / "release-version.txt").write_text(version, encoding="utf-8")
+    output = tmp_path / "output"
+    result = bash_script(
+        workflow_script("cd.yml", "deploy", "Validate deployment version"), ROOT,
+        METADATA_DIR=str(tmp_path), GITHUB_OUTPUT=str(output),
+        SHA="0123456789abcdef" * 2 + "01234567", TRIGGER_REF=ref,
+    )
+    assert (result.returncode == 0) == valid, result.stdout + result.stderr
+    if valid:
+        assert f"image_tag={image_tag}" in output.read_text(encoding="utf-8").splitlines()
+
+
 def test_release_tag_must_match_tested_commit_on_main(tmp_path):
     remote = tmp_path / "remote.git"
     work = tmp_path / "work"
@@ -77,11 +119,30 @@ def test_release_tag_must_match_tested_commit_on_main(tmp_path):
     git("tag", "v2.0.0", cwd=work)
     git("push", "origin", "v2.0.0", cwd=work)
 
-    script = workflow_script("cd.yml", "deploy", "Verify release belongs to main")
-    for version, sha, valid in (
-        ("v1.0.0", main_sha, True),
-        ("v1.0.0", other_sha, False),
-        ("v2.0.0", other_sha, False),
+    script = workflow_script("cd.yml", "deploy", "Verify deployment commit")
+    for version, sha, deployment_type, valid in (
+        ("v1.0.0", main_sha, "release", True),
+        ("v1.0.0", other_sha, "release", False),
+        ("v2.0.0", other_sha, "release", False),
+        ("main", main_sha, "main", True),
+        ("main", other_sha, "main", False),
     ):
-        result = bash_script(script, work, RELEASE_VERSION=version, SHA=sha)
+        result = bash_script(script, work, RELEASE_VERSION=version, SHA=sha, DEPLOYMENT_TYPE=deployment_type)
         assert (result.returncode == 0) == valid, result.stdout + result.stderr
+
+
+def test_rollback_restores_previous_task_definition(tmp_path):
+    log = tmp_path / "aws-calls"
+    script = """
+aws() { printf '%s\\n' "$*" >> "$AWS_CALLS"; }
+""" + workflow_script("cd.yml", "deploy", "Roll back to previous task definition")
+    task_definition = "arn:aws:ecs:ap-southeast-2:123456789012:task-definition/app:1"
+    result = bash_script(
+        script, ROOT, AWS_CALLS=str(log), CLUSTER="cluster", SERVICE="service",
+        TASK_DEFINITION=task_definition,
+    )
+    assert result.returncode == 0, result.stderr
+    assert log.read_text(encoding="utf-8").splitlines() == [
+        f"ecs update-service --cluster cluster --service service --task-definition {task_definition}",
+        "ecs wait services-stable --cluster cluster --services service",
+    ]

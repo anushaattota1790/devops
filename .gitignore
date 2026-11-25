@@ -7,3 +7,5 @@ __pycache__/
 *.tfstate.*
 terraform.tfvars
 crash.log
+/pulumi/Pulumi.*.yaml
+!/pulumi/Pulumi.template.yaml
