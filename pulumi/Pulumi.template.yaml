@@ -1,0 +1,11 @@
+# Example values only. Configure each stack with `pulumi config set`.
+config:
+  aws:region: ap-southeast-2
+  healthz-app:project: healthz-app
+  healthz-app:domainName: healthz.example.com
+  healthz-app:hostedZoneName: example.com
+  healthz-app:githubRepository: owner/repository
+  healthz-app:useExistingGithubOidcProvider: false
+  healthz-app:deployService: false
+  # Set imageTag only after pushing the image to the new ECR repository.
+  # healthz-app:imageTag: bootstrap

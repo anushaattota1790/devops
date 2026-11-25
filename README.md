@@ -1,6 +1,6 @@
 # Healthz service – DevOps assessment
 
-A small FastAPI service containerised and deployed to **AWS ECS Fargate** behind an **ALB with TLS**, provisioned by **Terraform** and delivered by **GitHub Actions**.
+A small FastAPI service containerised and deployed to **AWS ECS Fargate** behind an **ALB with TLS**, provisioned by **Pulumi** and delivered by **GitHub Actions**.
 
 ```
 git push main ─► CI (test, SAST, dep scan, IaC/secret scan, build, image scan, push to ECR)
@@ -16,17 +16,19 @@ Route53 ─► ALB :443 (ACM cert, TLS 1.3 policy) ─► ECS Fargate tasks (pri
 | `app/` | FastAPI app (`/healthz`), TLS bootstrap, container healthcheck |
 | `tests/` | pytest unit tests |
 | `Dockerfile` | Multi-stage, slim base, non-root (uid 10001), env-var config, `HEALTHCHECK` |
-| `terraform/` | VPC, ALB, ACM, Route53, ECR, ECS Fargate, IAM, GitHub OIDC role |
+| `pulumi/` | VPC, ALB, ACM, Route53, ECR, ECS Fargate, IAM and GitHub OIDC role; see its [setup guide](pulumi/README.md) |
 | `.github/workflows/ci.yml` | Test, scan, build, push |
 | `.github/workflows/cd.yml` | Deploy, verify, roll back |
 
 ## The application
 
-`GET /healthz` → `{"status":"ok","version":"<git sha>"}`
+`GET /healthz` → `{"status":"ok","version":"<git sha>","previous_version":"<previous git sha>"}`
 
-The version is baked into the image (`--build-arg APP_VERSION=<sha>`), so the endpoint proves which commit is live.
+`GET /readyz` → `200 {"status":"ready"}` after application startup, or `503 {"status":"not ready"}` before startup or during shutdown. This checks the application lifecycle only; it does not check external dependencies.
 
-Config (env vars): `PORT` (default 8080), `ENABLE_TLS` (default false; true in ECS), `APP_VERSION`, `HOST`.
+The version defaults to `dev` locally and is baked into the image (`--build-arg APP_VERSION=<sha>`). The deployment workflow sets `PREVIOUS_APP_VERSION` from the previous ECS task definition's image tag. The previous version is `null` when it is not supplied or the previous image is not tagged with a commit SHA, including the initial deployment. This is the version that was deployed before this task was created, not a deployment history; a rollback restores the old task's recorded value. During a rolling deployment, different tasks can temporarily report different versions.
+
+Config (env vars): `PORT` (default 8080), `ENABLE_TLS` (default false; true in ECS), `APP_VERSION`, `PREVIOUS_APP_VERSION`, `HOST`.
 
 Run locally:
 
@@ -42,48 +44,44 @@ docker run --rm -p 8080:8080 healthz-app
 
 ## Prerequisites
 
-- AWS account + credentials for the first `terraform apply` (CI/CD itself uses OIDC, no keys)
+- AWS account + credentials for Pulumi (CI/CD itself uses OIDC, no keys)
 - A **Route53 public hosted zone** for a domain you control
-- Terraform >= 1.6, a GitHub repo for this code
+- Pulumi CLI, Python 3.12, a state backend and a GitHub repo for this code
 
 ## Deploy from scratch
 
-1. **Provision infrastructure**
-   ```bash
-   cd terraform
-   cp terraform.tfvars.example terraform.tfvars    # set domain_name, hosted_zone_name, github_repository
-   terraform init
-   terraform apply -target=aws_ecr_repository.app -target=aws_iam_role_policy.github_actions   # bootstrap: ECR + CI role
-   ```
-   (Optional: configure the S3 backend in `versions.tf` first so state is remote and locked.)
+1. Follow the [Pulumi setup guide](pulumi/README.md) to configure state and provision the initial infrastructure. The first update creates ECR and the GitHub role, but not the ECS service.
 
 2. **Set GitHub repository variables** (Settings → Secrets and variables → Actions → *Variables*). No secrets are needed.
 
    | Variable | Value |
    |---|---|
    | `AWS_REGION` | `ap-southeast-2` |
-   | `AWS_ROLE_ARN` | `terraform output github_actions_role_arn` |
+   | `AWS_ROLE_ARN` | `pulumi stack output githubActionsRoleArn` |
    | `ECR_REPOSITORY` | `healthz-app` |
    | `ECS_CLUSTER` / `ECS_SERVICE` | `healthz-app` |
    | `APP_URL` | `https://<domain_name>` |
 
-3. **Push to `main`** – CI builds and pushes `healthz-app:<sha>` to ECR. (CD will fail the first time because the ECS service does not exist yet; that is expected.)
+3. **Push to `main`** – CI builds and pushes `healthz-app:<sha>` to ECR. CD will fail on this initial run because the ECS service does not exist yet.
 
-4. **Create the rest of the stack** using the image CI just pushed:
+4. **Create the service** using the image CI just pushed, from the `pulumi` directory:
    ```bash
-   terraform apply -var image_tag=<sha-from-ci>
+   pulumi config set imageTag <sha-from-ci>
+   pulumi config set deployService true
+   pulumi preview
+   pulumi up
    ```
-   The service starts, ACM validates via DNS, and the Route53 record is created.
+   The service starts using the existing ALB, certificate and Route53 record.
 
 5. From now on every merge to `main` deploys automatically.
 
-> If the account already has the GitHub OIDC provider, set `-var create_github_oidc_provider=false`.
-> Tear down with `terraform destroy` (the NAT gateway and ALB cost money while running).
+> If the account already has the GitHub OIDC provider, set `pulumi config set useExistingGithubOidcProvider true` before provisioning.
+> Review `pulumi preview --destroy` before `pulumi destroy`. The NAT gateway and ALB cost money while running.
 
 ## Testing the deployment
 
 ```bash
-curl -i https://<domain>/healthz            # 200 {"status":"ok","version":"<sha>"}
+curl -i https://<domain>/healthz            # 200 with current and previous versions
 curl -i http://<domain>/healthz             # 301 to HTTPS
 git rev-parse HEAD                          # should equal "version" after CD finishes
 ```
@@ -95,7 +93,7 @@ To see the pipeline prove the latest code is live: change something, merge to `m
 **CI** (`ci.yml`, PRs and `main`)
 1. pytest unit tests
 2. bandit (SAST) and pip-audit (dependency CVEs)
-3. Trivy filesystem scan for secrets and Terraform misconfigurations (`.trivyignore` documents accepted findings)
+3. Trivy filesystem scan for secrets and supported IaC misconfigurations (`.trivyignore` documents accepted findings)
 4. Docker build, then Trivy image scan (fails on fixable HIGH/CRITICAL)
 5. On `main` only: assume AWS role via OIDC, push the image to ECR tagged with the commit SHA (ECR tags are immutable, so a tag always maps to exactly one image)
 
@@ -103,7 +101,7 @@ To see the pipeline prove the latest code is live: change something, merge to `m
 1. Record the current task definition (rollback target)
 2. Render a new task definition revision with the new image and deploy a rolling update (100% min healthy, 200% max)
 3. Wait for service stability. The ECS deployment **circuit breaker** also rolls back automatically if new tasks never become healthy
-4. Smoke test the public URL until `/healthz` returns `ok` and the new SHA
+4. Smoke test the public URL until `/healthz` returns `ok`, the new SHA, and the previous version
 5. If anything fails, the pipeline explicitly rolls the service back to the previous task definition
 6. Deploys are serialised (`concurrency`) so two runs cannot race
 
@@ -128,4 +126,4 @@ To see the pipeline prove the latest code is live: change something, merge to `m
 
 - ECS Fargate chosen over EKS for lower operational overhead; EKS would be the choice for a larger platform or portability needs
 - Single NAT gateway (cost); use one per AZ for production. VPC endpoints for ECR/S3/Logs would remove NAT dependency
-- Next steps: blue/green or canary via CodeDeploy, WAF on the ALB, ALB access logs, alarms and dashboards (latency, 5xx, unhealthy hosts), multiple environments, `readonlyRootFilesystem`, image signing (cosign), Terraform plan on PR with a manual apply gate
+- Next steps: blue/green or canary via CodeDeploy, WAF on the ALB, ALB access logs, alarms and dashboards (latency, 5xx, unhealthy hosts), multiple environments, `readonlyRootFilesystem`, image signing (cosign), Pulumi preview on PR with a manual apply gate

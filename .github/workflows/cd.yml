@@ -45,6 +45,21 @@ jobs:
           aws ecs describe-task-definition --task-definition "${{ steps.previous.outputs.arn }}" \
             --query taskDefinition > task-definition.json
 
+      - name: Identify previous deployment version
+        id: previous_version
+        run: |
+          image=$(jq -er '
+            [.containerDefinitions[] | select(.name == "app") | .image] |
+            if length == 1 and (.[0] | type == "string") then .[0]
+            else error("Expected exactly one app container image") end
+          ' task-definition.json)
+          if [[ "$image" =~ :([0-9a-f]{40})$ ]]; then
+            echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Previous image does not have a commit SHA tag; previous version is unknown."
+            echo "version=" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Render task definition with new image
         id: render
         uses: aws-actions/amazon-ecs-render-task-definition@v1
@@ -52,6 +67,8 @@ jobs:
           task-definition: task-definition.json
           container-name: app
           image: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ env.SHA }}
+          environment-variables: |
+            PREVIOUS_APP_VERSION=${{ steps.previous_version.outputs.version }}
 
       - name: Deploy to ECS (rolling update, waits for stability)
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
@@ -62,17 +79,20 @@ jobs:
           wait-for-service-stability: true
           wait-for-minutes: 10
 
-      - name: Smoke test - live endpoint reports the new version
+      - name: Smoke test - live endpoint reports deployment versions
+        env:
+          PREVIOUS_VERSION: ${{ steps.previous_version.outputs.version }}
         run: |
           for i in $(seq 1 20); do
             body=$(curl -fsS --max-time 10 "${{ vars.APP_URL }}/healthz" || true)
             echo "attempt $i: $body"
-            if [ "$(echo "$body" | jq -r '.status + " " + .version')" = "ok $SHA" ]; then
+            if echo "$body" | jq -e --arg sha "$SHA" --arg previous "$PREVIOUS_VERSION" \
+              '.status == "ok" and .version == $sha and .previous_version == (if $previous == "" then null else $previous end)' > /dev/null; then
               echo "Deployment verified"; exit 0
             fi
             sleep 10
           done
-          echo "Live version did not match $SHA"; exit 1
+          echo "Live deployment versions did not match the expected values"; exit 1
 
       - name: Roll back to previous task definition
         if: failure() && steps.previous.outputs.arn != ''

@@ -1,3 +1,0 @@
-domain_name       = "healthz.example.com"
-hosted_zone_name  = "example.com"
-github_repository = "your-github-user/aus-post-devops-test"

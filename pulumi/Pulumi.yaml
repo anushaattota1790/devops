@@ -1,0 +1,6 @@
+name: healthz-app
+runtime:
+  name: python
+  options:
+    virtualenv: .venv
+description: ECS Fargate infrastructure for the healthz application
