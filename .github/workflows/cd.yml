@@ -8,7 +8,7 @@ on:
 
 permissions:
   actions: read
-  contents: read
+  contents: write
   id-token: write
 
 concurrency:
@@ -139,6 +139,63 @@ jobs:
           fi
           echo "ref=$image" >> "$GITHUB_OUTPUT"
 
+      - name: Select deployment version
+        if: steps.release.outputs.found == 'true'
+        id: deployment_version
+        env:
+          DEPLOYMENT_TYPE: ${{ steps.version.outputs.type }}
+          REQUESTED_VERSION: ${{ steps.version.outputs.version }}
+          IMAGE_EXISTS: ${{ steps.image.outputs.exists }}
+          IMAGE: ${{ steps.image.outputs.ref }}
+        run: |
+          git fetch origin --tags --force --prune --prune-tags
+          if [[ "$DEPLOYMENT_TYPE" == "release" ]] && [[ "$(git rev-parse "refs/tags/${REQUESTED_VERSION}^{commit}")" != "$SHA" ]]; then
+            echo "::error::Release tag no longer points to the tested commit."
+            exit 1
+          fi
+          if [[ "$IMAGE_EXISTS" == "true" ]]; then
+            docker pull "$IMAGE"
+            revision=$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
+            version=$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')
+            if [[ "$revision" != "$SHA" ]]; then
+              echo "::error::The immutable image does not match the tested commit."
+              exit 1
+            fi
+            if [[ "$DEPLOYMENT_TYPE" == "release" && "$version" != "$REQUESTED_VERSION" ]]; then
+              echo "::error::The immutable release image does not match the requested version."
+              exit 1
+            fi
+          elif [[ "$DEPLOYMENT_TYPE" == "release" ]]; then
+            version="$REQUESTED_VERSION"
+          else
+            version="v1.0.0"
+            tags=$(git tag --list 'v*' --sort=-version:refname)
+            while IFS= read -r tag; do
+              if [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+                major="${BASH_REMATCH[1]}"
+                minor="${BASH_REMATCH[2]}"
+                patch="${BASH_REMATCH[3]}"
+                if (( ${#patch} > 9 )); then
+                  echo "::error::The latest release patch number is too large to increment."
+                  exit 1
+                fi
+                version="v${major}.${minor}.$((patch + 1))"
+                break
+              fi
+            done <<< "$tags"
+          fi
+          if [[ ! "$version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || (( ${#version} > 128 )); then
+            echo "::error::The deployment image has an invalid release version."
+            exit 1
+          fi
+          if [[ "$DEPLOYMENT_TYPE" == "main" ]] && git show-ref --verify --quiet "refs/tags/$version"; then
+            if [[ "$(git rev-parse "refs/tags/${version}^{commit}")" != "$SHA" ]]; then
+              echo "::error::Release tag $version already points to another commit."
+              exit 1
+            fi
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - uses: docker/setup-buildx-action@v3
         if: steps.release.outputs.found == 'true' && steps.image.outputs.exists == 'false'
 
@@ -149,26 +206,12 @@ jobs:
           context: .
           load: true
           tags: ${{ steps.image.outputs.ref }}
-          build-args: APP_VERSION=${{ steps.version.outputs.version }}
+          build-args: APP_VERSION=${{ steps.deployment_version.outputs.version }}
           labels: |
             org.opencontainers.image.revision=${{ env.SHA }}
-            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.version=${{ steps.deployment_version.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      - name: Pull and verify existing release image
-        if: steps.release.outputs.found == 'true' && steps.image.outputs.exists == 'true'
-        env:
-          IMAGE: ${{ steps.image.outputs.ref }}
-          RELEASE_VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          docker pull "$IMAGE"
-          revision=$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
-          version=$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')
-          if [[ "$revision" != "$SHA" || "$version" != "$RELEASE_VERSION" ]]; then
-            echo "::error::The immutable release image does not match the requested commit and version."
-            exit 1
-          fi
 
       - name: Scan release image
         if: steps.release.outputs.found == 'true'
@@ -269,7 +312,7 @@ jobs:
           container-name: app
           image: ${{ steps.image.outputs.ref }}
           environment-variables: |
-            APP_VERSION=${{ steps.version.outputs.version }}
+            APP_VERSION=${{ steps.deployment_version.outputs.version }}
             PREVIOUS_APP_VERSION=${{ steps.previous_version.outputs.version }}
 
       - name: Deploy to ECS (rolling update, waits for stability)
@@ -287,7 +330,7 @@ jobs:
         if: steps.previous.outputs.available == 'true'
         id: smoke
         env:
-          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_VERSION: ${{ steps.deployment_version.outputs.version }}
           PREVIOUS_VERSION: ${{ steps.previous_version.outputs.version }}
           APP_URL: ${{ vars.APP_URL }}
         run: |
@@ -302,8 +345,26 @@ jobs:
           done
           echo "Live deployment versions did not match the expected values"; exit 1
 
+      - name: Create release tag
+        if: steps.previous.outputs.available == 'true' && steps.version.outputs.type == 'main'
+        id: tag
+        env:
+          RELEASE_VERSION: ${{ steps.deployment_version.outputs.version }}
+        run: |
+          git fetch origin --tags --force --prune --prune-tags
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_VERSION"; then
+            if [[ "$(git rev-parse "refs/tags/${RELEASE_VERSION}^{commit}")" != "$SHA" ]]; then
+              echo "::error::Release tag $RELEASE_VERSION already points to another commit."
+              exit 1
+            fi
+            echo "Release tag $RELEASE_VERSION already points to the deployed commit."
+          else
+            git tag "$RELEASE_VERSION" "$SHA"
+            git push origin "refs/tags/$RELEASE_VERSION"
+          fi
+
       - name: Roll back to previous task definition
-        if: failure() && steps.previous.outputs.arn != '' && (steps.deploy.outcome == 'failure' || (steps.deploy.outcome == 'success' && steps.smoke.outcome == 'failure'))
+        if: failure() && steps.previous.outputs.arn != '' && (steps.deploy.outcome == 'failure' || (steps.deploy.outcome == 'success' && (steps.smoke.outcome == 'failure' || steps.tag.outcome == 'failure')))
         env:
           CLUSTER: ${{ vars.ECS_CLUSTER }}
           SERVICE: ${{ vars.ECS_SERVICE }}

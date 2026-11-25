@@ -3,7 +3,7 @@
 A small FastAPI service containerised and deployed to **AWS ECS Fargate** behind an **ALB with TLS**, provisioned by **Pulumi** and delivered by **GitHub Actions**.
 
 ```
-git push origin main ─► CI ─► CD (verify commit, build and scan, push to ECR, deploy, smoke test, rollback)
+git push origin main ─► CI ─► CD (build, scan, deploy, smoke test, create release tag)
 git push origin v1.0.0 ─► CI ─► CD (verify release tag, build and scan, push, deploy, smoke test, rollback)
 
 Route53 ─► ALB :443 (ACM cert, TLS 1.3 policy) ─► ECS Fargate tasks (private subnets, HTTPS :8443)
@@ -26,7 +26,7 @@ Route53 ─► ALB :443 (ACM cert, TLS 1.3 policy) ─► ECS Fargate tasks (pri
 
 `GET /readyz` → `200 {"status":"ready"}` after application startup, or `503 {"status":"not ready"}` before startup or during shutdown. This checks the application lifecycle only; it does not check external dependencies.
 
-The version defaults to `dev` locally. A deployment from `main` displays `main-` followed by the first 12 characters of the commit SHA; a tagged release displays its tag, for example `v1.0.0`. The full SHA is recorded in the image label and used in the ECR tag for `main` deployments. The deployment workflow records the version of the previous task definition as `PREVIOUS_APP_VERSION`; older deployments can report a full commit SHA. It is `null` when unavailable. During a rolling deployment, different tasks can temporarily report different versions; rollback restores the old task definition and its recorded value.
+The version defaults to `dev` locally. A successful `main` deployment displays an automatically allocated release version such as `v1.0.1`; after the smoke test, CD creates a Git tag with that name pointing to the deployed commit. Manually pushed release tags display their tag. The full SHA is recorded in the image label and used in the ECR tag for `main` deployments. The deployment workflow records the version of the previous task definition as `PREVIOUS_APP_VERSION`; older deployments can report `main-<short-SHA>` or a full commit SHA. It is `null` when unavailable. During a rolling deployment, different tasks can temporarily report different versions; rollback restores the old task definition and its recorded value.
 
 Config (env vars): `PORT` (default 8080), `ENABLE_TLS` (default false; true in ECS), `APP_VERSION`, `PREVIOUS_APP_VERSION`, `HOST`.
 
@@ -72,9 +72,9 @@ docker run --rm -p 8080:8080 healthz-app
    pulumi preview
    pulumi up
    ```
-   Replace the placeholder with the actual SHA. The service starts using the existing ALB, certificate and Route53 record. Set the GitHub variable `BOOTSTRAP_MODE` to `false` or remove it after the service is created.
+   Replace the placeholder with the actual SHA. The service starts using the existing ALB, certificate and Route53 record. Set the GitHub variable `BOOTSTRAP_MODE` to `false` or remove it after the service is created. Rerun the bootstrap CD run to smoke-test the service and publish its release tag; ensure `main` has not moved in the meantime.
 
-5. From now on, successful `main` pushes trigger deployment automatically. A run is rejected if `main` has moved before its commit is verified; GitHub may also replace a pending deployment when newer runs are queued. To mark and deploy a release, push a new `vMAJOR.MINOR.PATCH` tag on a commit reachable from `main`. Restrict who can create or move release tags using GitHub rulesets.
+5. From now on, successful `main` pushes trigger deployment automatically. A run is rejected if `main` has moved before its commit is verified; GitHub may also replace a pending deployment when newer runs are queued. CD increments the patch component of the highest existing `vMAJOR.MINOR.PATCH` Git tag, or starts at `v1.0.0` if none exists. Major or minor versions can be advanced by manually pushing a new release tag on a commit reachable from `main`. Restrict who can create or move release tags using GitHub rulesets, but allow the Actions token to create the automatic tags.
 
 > If the account already has the GitHub OIDC provider, set `pulumi config set useExistingGithubOidcProvider true` before provisioning.
 > Review `pulumi preview --destroy` before `pulumi destroy`. The NAT gateway and ALB cost money while running.
@@ -84,10 +84,10 @@ docker run --rm -p 8080:8080 healthz-app
 ```bash
 curl -i https://<domain>/healthz            # 200 with current and previous versions
 curl -i http://<domain>/healthz             # 301 to HTTPS
-git rev-parse --short=12 HEAD              # should match the suffix of a main deployment version
+git tag --points-at HEAD                   # shows the automatically created release tag
 ```
 
-To verify automatic deployment, merge to `main` and watch the CD smoke test poll `/healthz` until `version` matches the new commit. A release tag instead deploys and displays the tag.
+To verify automatic deployment, merge to `main` and watch CD deploy, smoke-test `/healthz`, and create the matching release tag. The image revision label records the deployed commit. A manually pushed release tag also deploys and displays that tag.
 
 ## CI/CD behaviour
 
@@ -101,10 +101,12 @@ To verify automatic deployment, merge to `main` and watch the CD smoke test poll
 
 **CD** (`cd.yml`, triggered after CI succeeds)
 1. Validate deployment metadata; `main` deployments must match the latest `main` commit, while release tags must point to a tested commit reachable from `main`.
-2. Rebuild and scan the image, then push it with an immutable `sha-<full-SHA>` or release tag. The `org.opencontainers.image.revision` label records the commit SHA. For a retry, an existing image is verified and scanned before use.
+2. Allocate the next patch version for `main`, or use the manually pushed release tag. Rebuild and scan the image, then push it with an immutable `sha-<full-SHA>` or release tag. The `org.opencontainers.image.revision` label records the commit SHA. On retry, the existing image's revision and version are verified and the image is scanned before use.
 3. Record the current task definition, then deploy a rolling update (100% min healthy, 200% max) and wait for stability. The ECS deployment **circuit breaker** also rolls back if new tasks never become healthy.
-4. Smoke test `/healthz` for the deployment and previous version. If deployment or validation fails, roll back to the recorded task definition.
+4. Smoke test `/healthz` for the deployment and previous version. After a successful `main` smoke test, create a Git tag pointing to the deployed commit. If deployment, validation, or tag creation fails after an update, roll back to the recorded task definition. Tag conflicts fail rather than move existing tags; a failed network response can leave the tag published, so check GitHub before retrying.
 5. Deployments are serialised (`concurrency`) so two runs cannot race. GitHub allows one running and one pending run in the group; a newer pending run replaces an older one.
+
+CD needs GitHub Actions `contents: write` permission to create tags. Configure repository Actions settings and tag rulesets to allow this. A tag pushed with `GITHUB_TOKEN` does not trigger a second CI/CD run; tags pushed by a user do. The bootstrap image is not tagged in Git until the service is created and the CD run is rerun successfully.
 
 ## Security
 
@@ -119,7 +121,7 @@ To verify automatic deployment, merge to `main` and watch the CD smoke test poll
 - **Trunk-based / GitHub Flow**: use short-lived branches and pull requests into `main`. Branch protection is recommended but must be configured separately in GitHub; for a sole contributor, requiring an approving reviewer may block merges.
 - Short-lived `feature/*`, `fix/*` branches off `main`; small PRs; squash merge
 - CI runs on every PR and push to `main`; successful pushes to `main` trigger deployment. Pushing a release tag also triggers deployment.
-- **Versioning**: main images use the full SHA in their immutable ECR tag and a short SHA in the displayed version; release images use `v1.2.0`-style tags. Image labels record the full SHA.
+- **Versioning**: `main` deployments create `v1.2.3`-style Git tags and use the full SHA in their immutable ECR tag; manually tagged releases use the Git tag as their ECR tag. Image labels record the full SHA.
 - **Hotfix**: branch from `main`, fast-track PR; rollback restores the previous task definition
 - **Release safety**: feature flags for incomplete work; environments (dev → staging → prod) with approval gates can be added by promoting the same image digest
 

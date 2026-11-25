@@ -144,9 +144,14 @@ the HTTP URL redirects to HTTPS.
 
 Remove the `BOOTSTRAP_MODE` GitHub variable or set it to `false` after the
 service exists, so an unexpectedly missing service causes a deployment failure.
+Rerun the bootstrap CD run to smoke-test the service and create its Git release
+tag; the tested commit must still be the tip of `main`.
 Successful pushes to `main` trigger deployment automatically. Stale runs are
 rejected if `main` has moved before verification, and newer runs can replace
-pending runs. `vMAJOR.MINOR.PATCH` tags can also be pushed to deploy a named release. CD manages the ECS
+pending runs. After a successful smoke test, CD creates a Git tag with the next
+patch version. Allow its Actions token to create release tags in repository
+settings and any tag rulesets. `vMAJOR.MINOR.PATCH` tags can also be pushed
+manually to deploy a named release. CD manages the ECS
 task definition, while autoscaling manages desired count; Pulumi ignores changes
 to those two service properties. **Run `pulumi refresh` before later Pulumi
 updates**, then preview the changes, so Pulumi state reflects deployments made

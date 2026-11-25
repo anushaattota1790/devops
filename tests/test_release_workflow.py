@@ -131,6 +131,113 @@ def test_release_tag_must_match_tested_commit_on_main(tmp_path):
         assert (result.returncode == 0) == valid, result.stdout + result.stderr
 
 
+@pytest.fixture
+def release_repository(tmp_path):
+    remote = tmp_path / "remote.git"
+    work = tmp_path / "work"
+
+    def git(*args, cwd=work):
+        return subprocess.run(
+            ["git", *map(str, args)], cwd=cwd, capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+    git("init", "--bare", remote, cwd=tmp_path)
+    git("clone", remote, work, cwd=tmp_path)
+    git("config", "user.email", "test@example.invalid")
+    git("config", "user.name", "Test")
+    git("checkout", "-b", "main")
+    (work / "file").write_text("first", encoding="utf-8")
+    git("add", "file")
+    git("commit", "-m", "first")
+    first = git("rev-parse", "HEAD")
+    (work / "file").write_text("second", encoding="utf-8")
+    git("commit", "-am", "second")
+    sha = git("rev-parse", "HEAD")
+    git("push", "origin", "main")
+    return work, git, first, sha
+
+
+@pytest.mark.parametrize(
+    ("tags", "expected"),
+    [
+        ([], "v1.0.0"),
+        (["v1.0.9", "v1.1.3", "v2.0.0-rc1"], "v1.1.4"),
+    ],
+)
+def test_main_deployment_selects_next_patch_version(tmp_path, release_repository, tags, expected):
+    work, git, _, sha = release_repository
+    for tag in tags:
+        git("tag", tag)
+    git("push", "origin", "--tags")
+    output = tmp_path / "output"
+    result = bash_script(
+        workflow_script("cd.yml", "deploy", "Select deployment version"), work,
+        DEPLOYMENT_TYPE="main", REQUESTED_VERSION="unused", IMAGE_EXISTS="false",
+        IMAGE="unused", SHA=sha, GITHUB_OUTPUT=str(output),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert output.read_text(encoding="utf-8").strip() == f"version={expected}"
+
+
+def test_retry_reuses_image_version_and_rejects_conflicting_tag(tmp_path, release_repository):
+    work, git, first, sha = release_repository
+    git("tag", "v1.0.0", first)
+    git("push", "origin", "--tags")
+    script = """
+docker() {
+    if [[ "$1" == "pull" ]]; then return 0; fi
+    if [[ "$*" == *revision* ]]; then echo "$MOCK_REVISION"; else echo "$MOCK_VERSION"; fi
+}
+""" + workflow_script("cd.yml", "deploy", "Select deployment version")
+    output = tmp_path / "output"
+    variables = dict(
+        DEPLOYMENT_TYPE="main", REQUESTED_VERSION="unused", IMAGE_EXISTS="true",
+        IMAGE="example", SHA=sha, GITHUB_OUTPUT=str(output), MOCK_REVISION=sha,
+    )
+    result = bash_script(script, work, MOCK_VERSION="v1.0.1", **variables)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert output.read_text(encoding="utf-8").strip() == "version=v1.0.1"
+    result = bash_script(script, work, MOCK_VERSION="v1.0.0", **variables)
+    assert result.returncode != 0
+    assert "already points to another commit" in result.stdout
+    variables["MOCK_REVISION"] = first
+    result = bash_script(script, work, MOCK_VERSION="v1.0.1", **variables)
+    assert result.returncode != 0
+    assert "does not match the tested commit" in result.stdout
+
+
+def test_manual_release_keeps_its_tag_and_checks_commit(tmp_path, release_repository):
+    work, git, first, sha = release_repository
+    git("tag", "v2.0.0", sha)
+    git("push", "origin", "--tags")
+    output = tmp_path / "output"
+    script = workflow_script("cd.yml", "deploy", "Select deployment version")
+    variables = dict(
+        DEPLOYMENT_TYPE="release", REQUESTED_VERSION="v2.0.0", IMAGE_EXISTS="false",
+        IMAGE="unused", GITHUB_OUTPUT=str(output),
+    )
+    result = bash_script(script, work, SHA=sha, **variables)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert output.read_text(encoding="utf-8").strip() == "version=v2.0.0"
+    result = bash_script(script, work, SHA=first, **variables)
+    assert result.returncode != 0
+    assert "no longer points to the tested commit" in result.stdout
+
+
+def test_publish_release_tag_is_idempotent_and_rejects_conflicts(release_repository):
+    work, git, first, sha = release_repository
+    git("tag", "v1.0.0", first)
+    git("push", "origin", "--tags")
+    script = workflow_script("cd.yml", "deploy", "Create release tag")
+    for _ in range(2):
+        result = bash_script(script, work, RELEASE_VERSION="v1.0.1", SHA=sha)
+        assert result.returncode == 0, result.stdout + result.stderr
+    assert git("ls-remote", "--tags", "origin", "refs/tags/v1.0.1").split()[0] == sha
+    result = bash_script(script, work, RELEASE_VERSION="v1.0.0", SHA=sha)
+    assert result.returncode != 0
+    assert "already points to another commit" in result.stdout
+
+
 def test_rollback_restores_previous_task_definition(tmp_path):
     log = tmp_path / "aws-calls"
     script = """
