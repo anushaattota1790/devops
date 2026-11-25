@@ -86,7 +86,7 @@ curl -i https://<domain>/healthz            # 200 with current and previous vers
 curl -i http://<domain>/healthz             # 301 to HTTPS
 git tag --points-at HEAD                   # shows the automatically created release tag
 git fetch origin --tags
-git tag --points-at origin/main.
+git tag --points-at origin/main
 ```
 
 To verify automatic deployment, merge to `main` and watch CD deploy, smoke-test `/healthz`, and create the matching release tag. The image revision label records the deployed commit. A manually pushed release tag also deploys and displays that tag.
