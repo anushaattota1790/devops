@@ -244,6 +244,7 @@ def test_publish_release_tag_is_idempotent_and_rejects_conflicts(release_reposit
     [
         ("refs/heads/main", "bootstrap", "arn:aws:iam::123456789012:role/healthz-staging-github-actions", True),
         ("refs/heads/main", "deploy", "arn:aws:iam::123456789012:role/healthz-staging-github-actions", True),
+        ("refs/heads/main", "rollback-test", "arn:aws:iam::123456789012:role/healthz-staging-github-actions", True),
         ("refs/heads/feature", "deploy", "arn:aws:iam::123456789012:role/healthz-staging-github-actions", False),
         ("refs/heads/main", "deploy", "arn:aws:iam::123456789012:role/healthz-app-github-actions", False),
         ("refs/heads/main", "other", "arn:aws:iam::123456789012:role/healthz-staging-github-actions", False),
@@ -253,14 +254,27 @@ def test_staging_workflow_rejects_non_staging_roles_and_refs(tmp_path, ref, mode
     output = tmp_path / "output"
     result = bash_script(
         workflow_script("staging.yml", "staging", "Validate staging settings"), ROOT,
-        GITHUB_REF=ref, MODE=mode, ROLE_ARN=role, GITHUB_RUN_ID="42",
+        GITHUB_REF=ref, MODE=mode, ROLE_ARN=role, GITHUB_RUN_NUMBER="42",
         GITHUB_RUN_ATTEMPT="2", GITHUB_OUTPUT=str(output),
     )
     assert (result.returncode == 0) == valid, result.stdout + result.stderr
     if valid:
         assert output.read_text(encoding="utf-8").splitlines() == [
-            "account=123456789012", "version=staging-42-2"
+            "account=123456789012", "version=staging-v1.0.42-attempt2"
         ]
+
+
+@pytest.mark.parametrize(("attempt", "expected"), [("1", "staging-v1.0.7"), ("2", "staging-v1.0.7-attempt2")])
+def test_staging_versions_are_readable_and_unique_on_retry(tmp_path, attempt, expected):
+    output = tmp_path / "output"
+    result = bash_script(
+        workflow_script("staging.yml", "staging", "Validate staging settings"), ROOT,
+        GITHUB_REF="refs/heads/main", MODE="deploy",
+        ROLE_ARN="arn:aws:iam::123456789012:role/healthz-staging-github-actions",
+        GITHUB_RUN_NUMBER="7", GITHUB_RUN_ATTEMPT=attempt, GITHUB_OUTPUT=str(output),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"version={expected}" in output.read_text(encoding="utf-8").splitlines()
 
 
 @pytest.mark.skipif(shutil.which("jq") is None, reason="jq is needed for staging service checks")
@@ -271,6 +285,8 @@ def test_staging_workflow_rejects_non_staging_roles_and_refs(tmp_path, ref, mode
         ("deploy", {"services": [], "failures": [{"reason": "MISSING"}]}, False),
         ("bootstrap", {"services": [{"status": "ACTIVE", "taskDefinition": "arn:stage"}], "failures": []}, False),
         ("deploy", {"services": [{"status": "ACTIVE", "taskDefinition": "arn:stage"}], "failures": []}, True),
+        ("rollback-test", {"services": [{"status": "ACTIVE", "taskDefinition": "arn:stage"}], "failures": []}, True),
+        ("rollback-test", {"services": [], "failures": [{"reason": "MISSING"}]}, False),
         ("bootstrap", {"services": [], "failures": [{"reason": "ACCESS_DENIED"}]}, False),
     ],
 )
@@ -283,8 +299,73 @@ aws() { printf '%s\\n' "$MOCK_SERVICE"; }
         GITHUB_OUTPUT=str(tmp_path / "output"), MOCK_SERVICE=json.dumps(response),
     )
     assert (result.returncode == 0) == valid, result.stdout + result.stderr
-    if valid and mode == "deploy":
+    if valid and mode != "bootstrap":
         assert (tmp_path / "output").read_text(encoding="utf-8").strip() == "arn=arn:stage"
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="jq is needed for staging version checks")
+@pytest.mark.parametrize("version", ["staging-45739182389-1", "staging-v1.0.4", "staging-v1.0.4-attempt2"])
+def test_staging_previous_version_supports_existing_and_readable_tags(tmp_path, version):
+    (tmp_path / "task-definition.json").write_text(json.dumps({
+        "containerDefinitions": [{"name": "app", "image": f"registry/app:{version}"}],
+    }), encoding="utf-8")
+    output = tmp_path / "output"
+    result = bash_script(
+        workflow_script("staging.yml", "staging", "Identify previous staging version"), tmp_path,
+        GITHUB_OUTPUT=str(output),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert output.read_text(encoding="utf-8").splitlines() == [f"version={version}", "previous="]
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="jq is needed for staging health checks")
+@pytest.mark.parametrize(("mode", "healthy", "successful", "intentional"), [
+    ("deploy", True, True, False),
+    ("rollback-test", True, False, True),
+    ("rollback-test", False, False, False),
+])
+def test_staging_rollback_test_only_fails_after_healthy_deployment(tmp_path, mode, healthy, successful, intentional):
+    output = tmp_path / "output"
+    script = """
+curl() { printf '%s\\n' "$MOCK_HEALTH"; }
+sleep() { :; }
+""" + workflow_script("staging.yml", "staging", "Verify staging health")
+    result = bash_script(
+        script, ROOT, MODE=mode, VERSION="staging-v1.0.8", PREVIOUS="staging-v1.0.7",
+        APP_URL="https://example.invalid", GITHUB_OUTPUT=str(output),
+        MOCK_HEALTH=json.dumps({
+            "status": "ok", "version": "staging-v1.0.8" if healthy else "staging-v1.0.6",
+            "previous_version": "staging-v1.0.7",
+        }),
+    )
+    assert (result.returncode == 0) == successful, result.stdout + result.stderr
+    if intentional:
+        assert output.read_text(encoding="utf-8").strip() == "intentional=true"
+    else:
+        assert not output.exists()
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="jq is needed to verify restored health")
+@pytest.mark.parametrize(("task", "reported", "valid"), [
+    ("arn:old", "staging-v1.0.7", True),
+    ("arn:other", "staging-v1.0.7", False),
+    ("arn:old", "staging-v1.0.8", False),
+])
+def test_staging_rollback_verifies_task_and_version(tmp_path, task, reported, valid):
+    summary = tmp_path / "summary"
+    script = """
+aws() { printf '%s\\n' "$MOCK_SERVICE"; }
+curl() { printf '%s\\n' "$MOCK_HEALTH"; }
+sleep() { :; }
+""" + workflow_script("staging.yml", "staging", "Verify intentional rollback")
+    result = bash_script(
+        script, ROOT, CLUSTER="healthz-staging", SERVICE="healthz-staging",
+        TASK_DEFINITION="arn:old", VERSION="staging-v1.0.7", PREVIOUS="",
+        APP_URL="https://example.invalid", GITHUB_STEP_SUMMARY=str(summary),
+        MOCK_SERVICE=json.dumps({"services": [{"status": "ACTIVE", "taskDefinition": task}], "failures": []}),
+        MOCK_HEALTH=json.dumps({"status": "ok", "version": reported, "previous_version": None}),
+    )
+    assert (result.returncode == 0) == valid, result.stdout + result.stderr
 
 
 def test_rollback_restores_previous_task_definition(tmp_path):

@@ -117,7 +117,8 @@ The optional staging stack uses separate AWS resources and a manually triggered
 workflow; see the [staging setup](pulumi/README.md#staging-stack). It uses
 `healthz-staging` resources and `staging.anusha-devops.com` for this account.
 The workflow accepts only the staging IAM role and `main`, and never creates
-production release tags. It has not yet been used to prove a real failure rollback.
+production release tags. Staging uses readable run-number versions and offers
+an intentional rollback test; see the staging setup for how to verify it.
 Staging infrastructure incurs separate AWS charges until it is destroyed.
 
 ## Security

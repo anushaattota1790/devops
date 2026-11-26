@@ -197,10 +197,22 @@ workflow is merged into `main`:
    rolling update and verifies `/healthz`. If deployment or validation fails,
    it attempts to restore the previous staging task definition.
 
+Staging image and application versions use the workflow run number, for
+example `staging-v1.0.4`. Reruns add an attempt suffix; failed or other runs can
+leave gaps. Existing `staging-<run-id>-<attempt>` versions remain supported.
+After two successful deployments, both current and previous versions use the
+new format.
+
+To test automatic rollback, run the staging workflow from `main` in
+`rollback-test` mode. It deploys and verifies a new image, intentionally fails
+the health step, then restores the previous task definition and checks the
+restored version. The job is expected to be **red**; check that the **Verify
+intentional rollback** step succeeded and the job summary confirms verification.
+If either is missing or fails, investigate before treating the test as passed.
+This test affects staging and may temporarily interrupt it.
+
 The workflow validates the staging-specific IAM role and targets only
-`healthz-staging`; it does not deploy to the production service. It doesn't
-automatically induce failures. Test a real rollback separately and only after
-reviewing the test plan. To clean up, review `pulumi preview --stack staging
+`healthz-staging`; it does not deploy to the production service. To clean up, review `pulumi preview --stack staging
 --destroy` before `pulumi destroy --stack staging`; image removal may be needed
 before the staging ECR repository can be destroyed. Never destroy the `dev`
 stack as part of staging cleanup.
