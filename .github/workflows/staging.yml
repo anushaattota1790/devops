@@ -4,12 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Bootstrap an image or deploy an existing staging service"
+        description: "Bootstrap, deploy, or test rollback on the staging service"
         required: true
         type: choice
         options:
           - bootstrap
           - deploy
+          - rollback-test
 
 permissions:
   contents: read
@@ -38,16 +39,23 @@ jobs:
             echo "::error::Run this workflow from main."
             exit 1
           fi
-          if [[ "$MODE" != "bootstrap" && "$MODE" != "deploy" ]]; then
-            echo "::error::Select bootstrap or deploy."
+          if [[ "$MODE" != "bootstrap" && "$MODE" != "deploy" && "$MODE" != "rollback-test" ]]; then
+            echo "::error::Select bootstrap, deploy, or rollback-test."
             exit 1
           fi
           if [[ ! "$ROLE_ARN" =~ ^arn:aws:iam::([0-9]{12}):role/healthz-staging-github-actions$ ]]; then
             echo "::error::STAGING_ROLE_ARN must identify the staging role."
             exit 1
           fi
-          echo "account=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
-          echo "version=staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+          account="${BASH_REMATCH[1]}"
+          if [[ ! "$GITHUB_RUN_NUMBER" =~ ^[1-9][0-9]*$ || ! "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::Invalid workflow run number or attempt."
+            exit 1
+          fi
+          version="staging-v1.0.${GITHUB_RUN_NUMBER}"
+          if [[ "$GITHUB_RUN_ATTEMPT" != "1" ]]; then version="${version}-attempt${GITHUB_RUN_ATTEMPT}"; fi
+          echo "account=$account" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
 
@@ -79,8 +87,8 @@ jobs:
             fi
           else
             arn=$(jq -er 'if (.failures | length) == 0 and (.services | length) == 1 and .services[0].status == "ACTIVE" then .services[0].taskDefinition else error("Staging service lookup failed") end' <<< "$result")
-            if [[ "$MODE" != "deploy" || "$arn" != arn:* ]]; then
-              echo "::error::Bootstrap requires a missing service; deploy requires its task definition."
+            if [[ "$MODE" == "bootstrap" || "$arn" != arn:* ]]; then
+              echo "::error::Bootstrap requires a missing service; deploy and rollback-test require its task definition."
               exit 1
             fi
             echo "arn=$arn" >> "$GITHUB_OUTPUT"
@@ -133,7 +141,7 @@ jobs:
           echo "Set this as the staging Pulumi imageTag before creating the service." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Fetch staging task definition
-        if: inputs.mode == 'deploy'
+        if: inputs.mode != 'bootstrap'
         env:
           TASK_DEFINITION: ${{ steps.service.outputs.arn }}
         run: |
@@ -141,20 +149,26 @@ jobs:
             --query taskDefinition > task-definition.json
 
       - name: Identify previous staging version
-        if: inputs.mode == 'deploy'
+        if: inputs.mode != 'bootstrap'
         id: previous_version
         run: |
           image=$(jq -er '[.containerDefinitions[] | select(.name == "app") | .image] | if length == 1 and (.[0] | type == "string") then .[0] else error("Expected one app image") end' task-definition.json)
           version=$(jq -r '[.containerDefinitions[] | select(.name == "app") | .environment[]? | select(.name == "APP_VERSION") | .value] | first // ""' task-definition.json)
           if [[ -z "$version" ]]; then version="${image##*:}"; fi
-          if [[ ! "$version" =~ ^staging-[0-9]+-[0-9]+$ ]]; then
+          if [[ ! "$version" =~ ^staging-([0-9]+-[0-9]+|v1\.0\.[1-9][0-9]*(-attempt[1-9][0-9]*)?)$ ]]; then
             echo "::error::The previous staging version could not be determined."
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          previous=$(jq -r '[.containerDefinitions[] | select(.name == "app") | .environment[]? | select(.name == "PREVIOUS_APP_VERSION") | .value] | first // ""' task-definition.json)
+          if [[ -n "$previous" && ! "$previous" =~ ^staging-([0-9]+-[0-9]+|v1\.0\.[1-9][0-9]*(-attempt[1-9][0-9]*)?)$ ]]; then
+            echo "::error::The earlier staging version is invalid."
+            exit 1
+          fi
+          echo "previous=$previous" >> "$GITHUB_OUTPUT"
 
       - name: Render staging task definition
-        if: inputs.mode == 'deploy'
+        if: inputs.mode != 'bootstrap'
         id: render
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
@@ -166,7 +180,7 @@ jobs:
             PREVIOUS_APP_VERSION=${{ steps.previous_version.outputs.version }}
 
       - name: Deploy staging service
-        if: inputs.mode == 'deploy'
+        if: inputs.mode != 'bootstrap'
         id: deploy
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
@@ -177,7 +191,7 @@ jobs:
           wait-for-minutes: 10
 
       - name: Verify staging health
-        if: inputs.mode == 'deploy'
+        if: inputs.mode != 'bootstrap'
         id: smoke
         env:
           VERSION: ${{ steps.settings.outputs.version }}
@@ -188,6 +202,11 @@ jobs:
             echo "attempt $i: $body"
             if echo "$body" | jq -e --arg version "$VERSION" --arg previous "$PREVIOUS" \
               '.status == "ok" and .version == $version and .previous_version == $previous' > /dev/null; then
+              if [[ "$MODE" == "rollback-test" ]]; then
+                echo "intentional=true" >> "$GITHUB_OUTPUT"
+                echo "::error::Intentional staging failure to test rollback."
+                exit 1
+              fi
               echo "Staging deployment verified"
               exit 0
             fi
@@ -197,6 +216,7 @@ jobs:
           exit 1
 
       - name: Roll back staging service
+        id: rollback
         if: failure() && steps.service.outputs.arn != '' && (steps.deploy.outcome == 'failure' || (steps.deploy.outcome == 'success' && steps.smoke.outcome == 'failure'))
         env:
           TASK_DEFINITION: ${{ steps.service.outputs.arn }}
@@ -205,3 +225,30 @@ jobs:
             --task-definition "$TASK_DEFINITION" > /dev/null
           aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
           echo "Rolled staging back to $TASK_DEFINITION"
+
+      - name: Verify intentional rollback
+        if: failure() && inputs.mode == 'rollback-test' && steps.smoke.outputs.intentional == 'true' && steps.rollback.outcome == 'success'
+        env:
+          TASK_DEFINITION: ${{ steps.service.outputs.arn }}
+          VERSION: ${{ steps.previous_version.outputs.version }}
+          PREVIOUS: ${{ steps.previous_version.outputs.previous }}
+        run: |
+          current=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --output json |
+            jq -er 'if (.failures | length) == 0 and (.services | length) == 1 and .services[0].status == "ACTIVE" then .services[0].taskDefinition else error("Staging service lookup failed") end')
+          if [[ "$current" != "$TASK_DEFINITION" ]]; then
+            echo "::error::Staging did not restore the previous task definition."
+            exit 1
+          fi
+          for i in $(seq 1 20); do
+            body=$(curl -fsS --max-time 10 "$APP_URL/healthz" || true)
+            echo "attempt $i: $body"
+            if echo "$body" | jq -e --arg version "$VERSION" --arg previous "$PREVIOUS" \
+              '.status == "ok" and .version == $version and .previous_version == (if $previous == "" then null else $previous end)' > /dev/null; then
+              echo "Intentional rollback verified; the job is expected to be marked failed." >> "$GITHUB_STEP_SUMMARY"
+              echo "Intentional rollback verified."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::Staging did not report the restored version."
+          exit 1
