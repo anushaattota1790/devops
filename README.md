@@ -19,6 +19,7 @@ Route53 ─► ALB :443 (ACM cert, TLS 1.3 policy) ─► ECS Fargate tasks (pri
 | `pulumi/` | VPC, ALB, ACM, Route53, ECR, ECS Fargate, IAM and GitHub OIDC role; see its [setup guide](pulumi/README.md) |
 | `.github/workflows/ci.yml` | Test, scan and build |
 | `.github/workflows/cd.yml` | Verify release, build, scan, push, deploy and roll back |
+| `.github/workflows/staging.yml` | Manually build and deploy to the separate staging service |
 
 ## The application
 
@@ -109,6 +110,15 @@ To verify automatic deployment, merge to `main` and watch CD deploy, smoke-test 
 5. Deployments are serialised (`concurrency`) so two runs cannot race. GitHub allows one running and one pending run in the group; a newer pending run replaces an older one.
 
 CD needs GitHub Actions `contents: write` permission to create tags. Configure repository Actions settings and tag rulesets to allow this. A tag pushed with `GITHUB_TOKEN` does not trigger a second CI/CD run; tags pushed by a user do. The bootstrap image is not tagged in Git until the service is created and the CD run is rerun successfully.
+
+## Staging
+
+The optional staging stack uses separate AWS resources and a manually triggered
+workflow; see the [staging setup](pulumi/README.md#staging-stack). It uses
+`healthz-staging` resources and `staging.anusha-devops.com` for this account.
+The workflow accepts only the staging IAM role and `main`, and never creates
+production release tags. It has not yet been used to prove a real failure rollback.
+Staging infrastructure incurs separate AWS charges until it is destroyed.
 
 ## Security
 

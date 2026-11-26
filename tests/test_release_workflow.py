@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -236,6 +237,54 @@ def test_publish_release_tag_is_idempotent_and_rejects_conflicts(release_reposit
     result = bash_script(script, work, RELEASE_VERSION="v1.0.0", SHA=sha)
     assert result.returncode != 0
     assert "already points to another commit" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("ref", "mode", "role", "valid"),
+    [
+        ("refs/heads/main", "bootstrap", "arn:aws:iam::123456789012:role/healthz-staging-github-actions", True),
+        ("refs/heads/main", "deploy", "arn:aws:iam::123456789012:role/healthz-staging-github-actions", True),
+        ("refs/heads/feature", "deploy", "arn:aws:iam::123456789012:role/healthz-staging-github-actions", False),
+        ("refs/heads/main", "deploy", "arn:aws:iam::123456789012:role/healthz-app-github-actions", False),
+        ("refs/heads/main", "other", "arn:aws:iam::123456789012:role/healthz-staging-github-actions", False),
+    ],
+)
+def test_staging_workflow_rejects_non_staging_roles_and_refs(tmp_path, ref, mode, role, valid):
+    output = tmp_path / "output"
+    result = bash_script(
+        workflow_script("staging.yml", "staging", "Validate staging settings"), ROOT,
+        GITHUB_REF=ref, MODE=mode, ROLE_ARN=role, GITHUB_RUN_ID="42",
+        GITHUB_RUN_ATTEMPT="2", GITHUB_OUTPUT=str(output),
+    )
+    assert (result.returncode == 0) == valid, result.stdout + result.stderr
+    if valid:
+        assert output.read_text(encoding="utf-8").splitlines() == [
+            "account=123456789012", "version=staging-42-2"
+        ]
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="jq is needed for staging service checks")
+@pytest.mark.parametrize(
+    ("mode", "response", "valid"),
+    [
+        ("bootstrap", {"services": [], "failures": [{"reason": "MISSING"}]}, True),
+        ("deploy", {"services": [], "failures": [{"reason": "MISSING"}]}, False),
+        ("bootstrap", {"services": [{"status": "ACTIVE", "taskDefinition": "arn:stage"}], "failures": []}, False),
+        ("deploy", {"services": [{"status": "ACTIVE", "taskDefinition": "arn:stage"}], "failures": []}, True),
+        ("bootstrap", {"services": [], "failures": [{"reason": "ACCESS_DENIED"}]}, False),
+    ],
+)
+def test_staging_service_requires_the_expected_bootstrap_state(tmp_path, mode, response, valid):
+    script = """
+aws() { printf '%s\\n' "$MOCK_SERVICE"; }
+""" + workflow_script("staging.yml", "staging", "Check staging service")
+    result = bash_script(
+        script, ROOT, MODE=mode, CLUSTER="healthz-staging", SERVICE="healthz-staging",
+        GITHUB_OUTPUT=str(tmp_path / "output"), MOCK_SERVICE=json.dumps(response),
+    )
+    assert (result.returncode == 0) == valid, result.stdout + result.stderr
+    if valid and mode == "deploy":
+        assert (tmp_path / "output").read_text(encoding="utf-8").strip() == "arn=arn:stage"
 
 
 def test_rollback_restores_previous_task_definition(tmp_path):

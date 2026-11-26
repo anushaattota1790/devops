@@ -164,6 +164,47 @@ fixed version such as `APP_VERSION=0.1.0`.
 Infrastructure updates are not currently automated by the GitHub workflows;
 Pulumi commands above are run manually.
 
+## Staging stack
+
+The optional `staging` stack uses project name `healthz-staging` and domain
+`staging.anusha-devops.com`. It reuses the account's GitHub OIDC provider but
+creates its own networking, ECR repository, IAM roles, load balancer and ECS
+service. It shares the AWS account and state backend, so this is not account
+isolation. These resources incur charges, including before the service starts.
+Use `--stack staging` on every staging Pulumi command to avoid targeting `dev`.
+
+Once the initial staging infrastructure has been created and the staging
+workflow is merged into `main`:
+
+1. Set the GitHub Actions repository variable `STAGING_ROLE_ARN` to the output
+   of `pulumi stack output githubActionsRoleArn --stack staging`.
+2. In GitHub Actions, run **Staging deployment** on `main` with mode
+   `bootstrap`. It scans and pushes an image to the staging ECR repository.
+   The job summary reports the image tag. Bootstrap fails if the staging
+   service already exists.
+3. Configure and preview the staging service, replacing the placeholder with
+   that tag. Review the preview before applying:
+
+   ```powershell
+   pulumi config set --stack staging imageTag <staging-image-tag>
+   pulumi config set --stack staging deployService true
+   pulumi preview --stack staging
+   pulumi up --stack staging
+   ```
+
+4. Wait for staging tasks to become healthy. Run **Staging deployment** again
+   on `main` with mode `deploy`. It builds a new staging image, performs a
+   rolling update and verifies `/healthz`. If deployment or validation fails,
+   it attempts to restore the previous staging task definition.
+
+The workflow validates the staging-specific IAM role and targets only
+`healthz-staging`; it does not deploy to the production service. It doesn't
+automatically induce failures. Test a real rollback separately and only after
+reviewing the test plan. To clean up, review `pulumi preview --stack staging
+--destroy` before `pulumi destroy --stack staging`; image removal may be needed
+before the staging ECR repository can be destroyed. Never destroy the `dev`
+stack as part of staging cleanup.
+
 The ECR lifecycle policy retains tagged images so that active and rollback
 images are not automatically expired. Untagged images older than 30 days are
 eligible for expiry. Tagged images accrue storage charges; review and remove
