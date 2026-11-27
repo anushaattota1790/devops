@@ -1,6 +1,6 @@
 # Healthz service – DevOps assessment
 
-A small FastAPI service containerised and deployed to **AWS ECS Fargate** behind an **ALB with TLS**, provisioned by **Pulumi** and delivered by **GitHub Actions**.
+A small FastAPI service containerised and deployed to **AWS ECS Fargate** behind an **ALB with TLS**, provisioned by **Pulumi** and delivered by **GitHub Actions**. 
 
 ```
 git push origin main ─► CI ─► CD (build, scan, deploy, smoke test, create release tag)
